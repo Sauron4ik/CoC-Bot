@@ -369,14 +369,27 @@ async def cmd_listlinks(msg: types.Message):
         return
 
     if not player_links:
-        await msg.answer("📭 Список прив'язаних ігрових акаунтів наразі порожній.")
+        await msg.answer("📋 Список прив'язаних ігрових акаунтів наразі порожній.")
         return
 
-    text = "📋 <b>Список прив'язаних акаунтів:</b>\n\n"
+    # Групуємо теги за user_id
+    user_tags = {}
     for tag, user_id in player_links.items():
-        text += f"• Тег: <code>{tag}</code> ➡️ ID: <code>{user_id}</code>\n"
+        user_tags.setdefault(user_id, []).append(tag)
 
-    # Якщо акаунтів дуже багато, краще надсилати частинами, але зазвичай для клану ок
+    text = "📋 <b>Список прив'язаних акаунтів:</b>\n\n"
+
+    for user_id, tags in user_tags.items():
+        try:
+            member = await msg.bot.get_chat_member(msg.chat.id, user_id)
+            user = member.user
+            name = f"@{user.username}" if user.username else user.first_name
+        except Exception:
+            name = f"ID: {user_id}"
+
+        tags_str = ", ".join([f"<code>{t}</code>" for t in tags])
+        text += f"👤 <b>{name}</b>:\n└ Теги: {tags_str}\n\n"
+
     if len(text) > 4096:
         text = text[:4090] + "..."
 
