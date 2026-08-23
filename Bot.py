@@ -230,16 +230,18 @@ async def cmd_start(msg: types.Message):
     await msg.answer_photo(
         photo=photo,
         caption=(
-            "Привіт! Я помічник Саурона 🏰\n\n"
-            "Ось що ти можеш вибрати:\n"
-            "• `/link #ТЕГ_ГРАВЦЯ` — Прив'язати Telegram до акаунту\n"
-            "• `/player (нік_або_тег)` — Картка гравця (TH, кубки, донат)\n"
-            "• `/war` — Стан поточної війни (КВ)\n"
-            "• `/raid` — Звіт по рейд-вікенду\n"
-            "• `/cwl` — Звіт по Війнам Ліги\n"
-            "• `/stats` — Статистика гравців по усіх івентах за місяць\n"
-            "• `/weekly_report` — Звіт за тиждень (кубки та ліги)\n\n"
-            "Обирай потрібну дію кнопками нижче або вводь команди вручну!"
+        "Привіт! Я помічник Саурона 🏰\n\n"
+        "Ось що ти можеш вибрати:\n"
+        "• `/link #ТЕГ_ГРАВЦЯ` — Прив'язати Telegram до акаунта (адмінам: реплай + `/link #ТЕГ`)\n"
+        "• `/unlink` — Видалити прив'язку (через реплай або `/unlink #ТЕГ`)\n"
+        "• `/listlinks` — Список усіх прив'язаних акаунтів (адмінам)\n"
+        "• `/player (нік або тег)` — Картка гравця (ТН, кубки, донат)\n"
+        "• `/war` — Стан поточної війни (КВ)\n"
+        "• `/raid` — Звіт по рейд-вікенду\n"
+        "• `/cwl` — Звіт по Війнах Ліги\n"
+        "• `/stats` — Статистика гравців по усіх івентах за місяць\n"
+        "• `/weekly_report` — Звіт за тиждень (кубки та ліги)\n"
+        "Обирай потрібну дію кнопками нижче або вводь команди вручну!"
         ),
         reply_markup=kb,
         parse_mode="HTML"
@@ -260,32 +262,125 @@ async def process_callback_buttons(callback: types.CallbackQuery):
     
     await callback.answer()
 
+# Допоміжна функція перевірки на адміністратора
+async def is_admin(message: types.Message) -> bool:
+    if message.chat.type == 'private':
+        return True 
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+        return member.status in ['creator', 'administrator']
+    except Exception:
+        return False
+
+
 @dp.message(Command("link"))
 async def cmd_link(msg: types.Message):
     args = msg.text.split()
-    if len(args) < 2:
+    target_user_id = msg.from_user.id
+    target_user_name = msg.from_user.first_name
+    
+    admin_mode = await is_admin(msg)
+
+    # Якщо адмін зробив реплай на повідомлення іншого користувача
+    if admin_mode and msg.reply_to_message:
+        target_user_id = msg.reply_to_message.from_user.id
+        target_user_name = msg.reply_to_message.from_user.first_name
+        player_tag_arg_index = 1  # /link #TAG у реплаї
+    else:
+        player_tag_arg_index = 1  # звичайний виклик /link #TAG
+
+    if len(args) <= player_tag_arg_index:
         await msg.answer("Вкажіть ваш тег. Приклад: <code>/link #2ABC123</code>", parse_mode=ParseMode.HTML)
         return
-    
-    player_tag = args[1].upper().replace("%23", "#")
+
+    player_tag = args[player_tag_arg_index].upper().replace("%23", "#")
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
-    
-    user_id = msg.from_user.id
-    user_name = msg.from_user.first_name
-    
-    player_links[player_tag] = user_id
+
+    # Зберігаємо у твій словник згідно з твоєю структурою
+    player_links[player_tag] = target_user_id
     save_json(PLAYERS_FILE, player_links)
+
+    mention_html = f'<a href="tg://user?id={target_user_id}">{target_user_name}</a>'
     
-    mention_html = f'<a href="tg://user?id={user_id}">{user_name}</a>'
     from aiogram.types import FSInputFile
+    try:
+        photo = FSInputFile("22.jpg")  # шлях до потрібної картинки
+        await msg.answer_photo(
+            photo=photo,
+            caption=f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨",
+            parse_mode="HTML"
+        )
+    except Exception:
+        # Захист, якщо картинка 22.jpg раптом зникне з сервера
+        await msg.answer(f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨", parse_mode="HTML")
+
+
+@dp.message(Command("unlink"))
+async def cmd_unlink(msg: types.Message):
+    if not await is_admin(msg):
+        await msg.answer("❌ Ця команда доступна лише адміністраторам.")
+        return
+
+    target_user_id = None
+    if msg.reply_to_message:
+        target_user_id = msg.reply_to_message.from_user.id
+    else:
+        # Можна також спробувати знайти за тегом, якщо передали аргументом
+        args = msg.text.split()
+        if len(args) > 1:
+            target_tag = args[1].upper().replace("%23", "#")
+            if not target_tag.startswith("#"):
+                target_tag = "#" + target_tag
+            # Шукаємо і видаляємо за тегом
+            found_tag = None
+            for tag, uid in player_links.items():
+                if tag.upper() == target_tag:
+                    found_tag = tag
+                    break
+            if found_tag:
+                del player_links[found_tag]
+                save_json(PLAYERS_FILE, player_links)
+                await msg.answer(f"🗑 Прив'язку тегу <code>{found_tag}</code> успішно видалено!", parse_mode="HTML")
+                return
+
+    if not target_user_id:
+        await msg.answer("⚠️ Зробіть реплай (відповідь) на повідомлення користувача або вкажіть тег: <code>/unlink #TAG</code>", parse_mode="HTML")
+        return
+
+    # Шукаємо тег за user_id у твоєму словнику
+    found_tags = [tag for tag, uid in player_links.items() if uid == target_user_id]
     
-    photo = FSInputFile("22.jpg")  # шлях до потрібної картинки
-    await msg.answer_photo(
-        photo=photo,
-        caption=f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨",
-        parse_mode="HTML"
-    )
+    if not found_tags:
+        await msg.answer("❌ У цього користувача немає прив'язаних тегів.")
+        return
+
+    for tag in found_tags:
+        del player_links[tag]
+    
+    save_json(PLAYERS_FILE, player_links)
+    await msg.answer("🗑 Усі прив'язки цього користувача успішно видалено!")
+
+
+@dp.message(Command("listlinks"))
+async def cmd_listlinks(msg: types.Message):
+    if not await is_admin(msg):
+        await msg.answer("❌ Ця команда доступна лише адміністраторам.")
+        return
+
+    if not player_links:
+        await msg.answer("📭 Список прив'язаних ігрових акаунтів наразі порожній.")
+        return
+
+    text = "📋 <b>Список прив'язаних акаунтів:</b>\n\n"
+    for tag, user_id in player_links.items():
+        text += f"• Тег: <code>{tag}</code> ➡️ ID: <code>{user_id}</code>\n"
+
+    # Якщо акаунтів дуже багато, краще надсилати частинами, але зазвичай для клану ок
+    if len(text) > 4096:
+        text = text[:4090] + "..."
+
+    await msg.answer(text, parse_mode="HTML")
 
 @dp.message(Command("war"))
 async def cmd_war(msg: types.Message):
