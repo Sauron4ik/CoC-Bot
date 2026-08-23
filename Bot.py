@@ -368,29 +368,32 @@ async def cmd_listlinks(msg: types.Message):
         await msg.answer("❌ Ця команда доступна лише адміністраторам.")
         return
 
-    # Завантажуємо найсвіжіші дані з файлу
-    current_links = load_json(PLAYERS_FILE)
+    # Завантажуємо дані прямо з JSON-файлу
+    try:
+        with open(PLAYERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = player_links
 
-    if not current_links:
-        await msg.answer("📋 Список прив'язаних ігрових акаунтів наразі порожній.")
+    if not data:
+        await msg.answer("📋 Список прив'язаних ігрових акаунтів порожній.")
         return
-
-    target_chat_id = msg.chat.id if msg.chat.type in ['group', 'supergroup'] else GROUP_CHAT_ID
 
     # Групуємо теги за user_id
     user_tags = {}
-    for tag, uid in current_links.items():
+    for tag, uid in data.items():
         user_tags.setdefault(str(uid), []).append(tag)
 
     text = "📋 <b>Список прив'язаних акаунтів:</b>\n\n"
 
     for uid_str, tags in user_tags.items():
         display_name = f"ID: {uid_str}"
-        
+
+        # Пробуємо отримати інформацію про користувача з поточного чату
         clean_id = uid_str.lstrip('-')
         if clean_id.isdigit():
             try:
-                member = await msg.bot.get_chat_member(target_chat_id, int(uid_str))
+                member = await msg.bot.get_chat_member(msg.chat.id, int(uid_str))
                 u = member.user
                 display_name = f"@{u.username}" if u.username else (u.first_name or display_name)
             except Exception:
