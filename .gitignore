@@ -1,0 +1,7 @@
+.env
+bot_state.json
+history.json
+players.json
+players_leagues.json
+__pycache__/
+*.log
