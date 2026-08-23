@@ -368,27 +368,36 @@ async def cmd_listlinks(msg: types.Message):
         await msg.answer("❌ Ця команда доступна лише адміністраторам.")
         return
 
-    if not player_links:
+    # Завантажуємо найсвіжіші дані з файлу
+    current_links = load_json(PLAYERS_FILE)
+
+    if not current_links:
         await msg.answer("📋 Список прив'язаних ігрових акаунтів наразі порожній.")
         return
 
+    target_chat_id = msg.chat.id if msg.chat.type in ['group', 'supergroup'] else GROUP_CHAT_ID
+
     # Групуємо теги за user_id
     user_tags = {}
-    for tag, user_id in player_links.items():
-        user_tags.setdefault(user_id, []).append(tag)
+    for tag, uid in current_links.items():
+        user_tags.setdefault(str(uid), []).append(tag)
 
     text = "📋 <b>Список прив'язаних акаунтів:</b>\n\n"
 
-    for user_id, tags in user_tags.items():
-        try:
-            member = await msg.bot.get_chat_member(msg.chat.id, user_id)
-            user = member.user
-            name = f"@{user.username}" if user.username else user.first_name
-        except Exception:
-            name = f"ID: {user_id}"
+    for uid_str, tags in user_tags.items():
+        display_name = f"ID: {uid_str}"
+        
+        clean_id = uid_str.lstrip('-')
+        if clean_id.isdigit():
+            try:
+                member = await msg.bot.get_chat_member(target_chat_id, int(uid_str))
+                u = member.user
+                display_name = f"@{u.username}" if u.username else (u.first_name or display_name)
+            except Exception:
+                pass
 
         tags_str = ", ".join([f"<code>{t}</code>" for t in tags])
-        text += f"👤 <b>{name}</b>:\n└ Теги: {tags_str}\n\n"
+        text += f"👤 <b>{display_name}</b>:\n└ Теги: {tags_str}\n\n"
 
     if len(text) > 4096:
         text = text[:4090] + "..."
