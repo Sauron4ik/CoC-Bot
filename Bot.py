@@ -895,7 +895,7 @@ async def cmd_player_stats(msg: types.Message):
     available = [p for p in images if p.exists()]
     if available:
         try:
-            await msg.answer_photo(random.choice(available), caption=text, parse_mode=ParseMode.HTML)
+            await msg.answer_photo(FSInputFile(random.choice(available)), caption=text, parse_mode=ParseMode.HTML)
             return
         except Exception as exc:
             logging.warning("Не вдалося відправити картинку гравця: %s", exc)
