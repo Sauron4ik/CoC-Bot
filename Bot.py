@@ -1002,20 +1002,36 @@ async def check_raid_events(chat_id: int):
             bot_state["raid_24h_reminded"] = True
 
     if state == "ended" and bot_state.get("last_raid_state") == "ongoing":
+        total_loot = current.get("capitalTotalLoot", 0)
+        raids_completed = current.get("raidsCompleted", 0)
+        
         unfinished = []
+        total_attacks = 0
+
         for m in current.get("members", []):
             cnt = m.get("attacks", 0)
             if isinstance(cnt, dict):
                 cnt = cnt.get("count", 0)
+                
             limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
-            record_player_stats(m.get("tag"), m.get("name"), "raid", cnt, limit)
-            if cnt < limit:
-                unfinished.append(f"{format_mention(m['tag'], m['name'])} {cnt}/{limit} ⚔️")
-        
-        text = "Рейди закінчилися 🏹 Ми старалися!\n"
-        if unfinished:
-            text += "Ці гравці не зробили усі атаки — " + ", ".join(unfinished)
+            total_attacks += cnt
             
+            # Запис статистики гравця
+            record_player_stats(m.get("tag"), m.get("name"), "raid", cnt, limit)
+            
+            if cnt < limit:
+                unfinished.append(f"• {format_mention(m['tag'], m['name'])} — {cnt}/{limit} ⚔️")
+
+        text = "🏹 <b>Рейди закінчилися! Підбиваємо підсумки:</b>\n\n"
+        text += f"💰 <b>Всього добуто золота:</b> {total_loot:,}\n"
+        text += f"⚔️ <b>Всього зроблено атак:</b> {total_attacks}\n"
+        text += f"🏰 <b>Знищено ворожих районів:</b> {raids_completed}\n\n"
+
+        if unfinished:
+            text += f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
+        else:
+            text += "🎉 Усі учасники зробили максимум атак! Чудова робота!"
+
         await send_to_topic(chat_id, text)
 
     bot_state["last_raid_state"] = state
