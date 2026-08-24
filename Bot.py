@@ -1149,6 +1149,107 @@ async def background_checker():
             logging.error(f"Помилка фонової перевірки: {e}")
         await asyncio.sleep(300)
 
+@dp.message(Command("stats"))
+async def cmd_stats(msg: types.Message):
+    await msg.answer("📊 Збираю дані про пропущені атаки за місяць, зачекайте...")
+
+    # 1. Склад клану
+    clan_data = get_clash_data(f"clans/{ENCODED_TAG}/members")
+    if not clan_data or "items" not in clan_data:
+        await msg.answer("⚠️ Не вдалося отримати список учасників клану.")
+        return
+
+    # Ініціалізуємо лічильники для кожного гравця
+    stats = {}
+    for m in clan_data["items"]:
+        stats[m["tag"]] = {
+            "name": m["name"],
+            "missed_cw": 0,
+            "missed_cwl": 0,
+            "missed_raid": 0
+        }
+
+    # 2. Перевірка звичайних КВ (War Log)
+    warlog = get_clash_data(f"clans/{ENCODED_TAG}/warlog")
+    if warlog and "items" in warlog:
+        # Беремо останні КВ за місяць (наприклад, до 10 останніх війн)
+        for entry in warlog.get("items", [])[:10]:
+            # Якщо є детальні дані про війну
+            if "clan" in entry and "members" in entry["clan"]:
+                for m in entry["clan"]["members"]:
+                    tag = m.get("tag")
+                    if tag in stats:
+                        attacks_done = len(m.get("attacks", []))
+                        # У звичайній КВ дається 2 атаки
+                        if attacks_done < 2:
+                            stats[tag]["missed_cw"] += (2 - attacks_done)
+
+    # 3. Перевірка ЛВК (CWL)
+    cwl_group = get_clash_data(f"clans/{ENCODED_TAG}/currentwar/leaguegroup")
+    if cwl_group and "rounds" in cwl_group:
+        for r in cwl_group.get("rounds", []):
+            for war_tag in r.get("warTags", []):
+                if war_tag == "#0":
+                    continue
+                war_data = get_clash_data(f"clanwarleagues/wars/{ENCODED_TAG_URL(war_tag)}")
+                if not war_data:
+                    continue
+                
+                # Визначаємо, де наш клан (clan чи opponent)
+                our_clan = None
+                if war_data.get("clan", {}).get("tag") == f"#{ENCODED_TAG}":
+                    our_clan = war_data["clan"]
+                elif war_data.get("opponent", {}).get("tag") == f"#{ENCODED_TAG}":
+                    our_clan = war_data["opponent"]
+
+                if our_clan and "members" in our_clan:
+                    for m in our_clan["members"]:
+                        tag = m.get("tag")
+                        if tag in stats:
+                            # В ЛВК дається 1 атака на день
+                            if len(m.get("attacks", [])) == 0:
+                                stats[tag]["missed_cwl"] += 1
+
+    # 4. Перевірка Рейд-вікендів (останні 4 тижні)
+    raid_data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
+    if raid_data and "items" in raid_data:
+        for raid in raid_data.get("items", [])[:4]:
+            for m in raid.get("members", []):
+                tag = m.get("tag")
+                if tag in stats:
+                    attacks_done = m.get("attacks", 0)
+                    limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
+                    if attacks_done < limit:
+                        stats[tag]["missed_raid"] += (limit - attacks_done)
+
+    # 5. Формування звіту
+    debtors = []
+    for tag, p in stats.items():
+        total_missed = p["missed_cw"] + p["missed_cwl"] + p["missed_raid"]
+        if total_missed > 0:
+            debtors.append((total_missed, p))
+
+    if not debtors:
+        await msg.answer("🎉 **Ідеально!** За останній місяць жоден гравець не пропустив жодної атаки.")
+        return
+
+    # Сортуємо: зверху ті, у кого найбільше пропусків
+    debtors.sort(key=lambda x: x[0], reverse=True)
+
+    lines = ["📊 **Статистика пропущених атак за місяць:**\n"]
+    for _, p in debtors:
+        details = []
+        if p["missed_cw"] > 0:
+            details.append(f"⚔️ КВ: **{p['missed_cw']}**")
+        if p["missed_cwl"] > 0:
+            details.append(f"🏆 ЛВК: **{p['missed_cwl']}**")
+        if p["missed_raid"] > 0:
+            details.append(f"🏰 Рейди: **{p['missed_raid']}**")
+
+        lines.append(f"• **{p['name']}**: " + ", ".join(details))
+
+    await msg.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
 @dp.message(Command("raidstats"))
 async def cmd_raidstats(msg: types.Message):
     data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
