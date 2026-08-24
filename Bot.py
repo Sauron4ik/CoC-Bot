@@ -1111,7 +1111,7 @@ async def check_youtube_news():
                 f"{hint_text}"
             )
 
-            chat_id = getattr(bot, 'target_chat_id', CHAT_ID)
+            chat_id = CHAT_ID
             if chat_id:
                 await bot.send_message(
                     chat_id=chat_id,
@@ -1129,7 +1129,7 @@ async def check_youtube_news():
 async def background_checker():
     while True:
         try:
-            target_id = getattr(bot, 'target_chat_id', CHAT_ID)
+            target_id = CHAT_ID
             if target_id and target_id != 0:
                 await check_war_events(target_id)
                 await check_raid_events(target_id)
@@ -1137,7 +1137,7 @@ async def background_checker():
                 await check_youtube_news()
                 
                 now = datetime.now()
-                if now.weekday() == 0 and now.hour == 10:
+                if now.weekday() == 0 and now.hour == 14 and now.minute < 5:
                     report_text = await process_weekly_league_report()
                     await bot.send_message(
                         target_id,
@@ -1147,7 +1147,7 @@ async def background_checker():
                     )
         except Exception as e:
             logging.error(f"Помилка фонової перевірки: {e}")
-        await asyncio.sleep(3600)
+        await asyncio.sleep(300)
 
 @dp.message(Command("raidstats"))
 async def cmd_raidstats(msg: types.Message):
@@ -1197,10 +1197,6 @@ async def cmd_raidstats(msg: types.Message):
         text += "🎉 Усі учасники зробили максимум атак!"
 
     await msg.answer(text, parse_mode="HTML")
-
-@dp.message()
-async def save_chat_id(msg: types.Message):
-    bot.target_chat_id = msg.chat.id
 
 async def main():
     logging.basicConfig(level=logging.INFO)
