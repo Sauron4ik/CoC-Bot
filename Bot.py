@@ -238,6 +238,7 @@ async def cmd_start(msg: types.Message):
         "• `/player (нік або тег)` — Картка гравця (ТН, кубки, донат)\n"
         "• `/war` — Стан поточної війни (КВ)\n"
         "• `/raid` — Звіт по рейд-вікенду\n"
+        "• `/raidstats` — Підсумки останнього рейду (золото, боржники)\n"
         "• `/cwl` — Звіт по Війнах Ліги\n"
         "• `/stats` — Статистика гравців по усіх івентах за місяць\n"
         "• `/weekly_report` — Звіт за тиждень (кубки та ліги)\n"
@@ -1071,6 +1072,48 @@ async def background_checker():
         except Exception as e:
             logging.error(f"Помилка фонової перевірки: {e}")
         await asyncio.sleep(3600)
+        
+@dp.message(Command("raidstats"))
+async def cmd_raidstats(msg: types.Message):
+    data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
+    if not data or "items" not in data or not data["items"]:
+        await msg.answer("⚠️ Не вдалося отримати дані про рейди від Supercell.")
+        return
+
+    last_raid = data["items"][0]
+
+    total_loot = last_raid.get("capitalTotalLoot", 0)
+    raids_completed = last_raid.get("raidsCompleted", 0)
+    members = last_raid.get("members", [])
+
+    unfinished = []
+    total_attacks = 0
+
+    for m in members:
+        tag = m.get("tag", "")
+        name = m.get("name", "Гравець")
+        used = m.get("attacks", 0)
+
+        if isinstance(used, dict):
+            used = used.get("count", 0)
+
+        limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
+        total_attacks += used
+
+        if used < limit:
+            unfinished.append(f"• {format_mention(tag, name)} — {used}/{limit} ⚔️")
+
+    text = f"🏹 <b>Підсумки останнього рейду:</b>\n\n"
+    text += f"💰 <b>Всього добуто золота:</b> {total_loot:,}\n"
+    text += f"⚔️ <b>Всього зроблено атак:</b> {total_attacks}\n"
+    text += f"🏰 <b>Знищено ворожих районів:</b> {raids_completed}\n\n"
+
+    if unfinished:
+        text += f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
+    else:
+        text += "🎉 Усі учасники зробили максимум атак!"
+
+    await msg.answer(text, parse_mode="HTML")
 
 @dp.message()
 async def save_chat_id(msg: types.Message):
