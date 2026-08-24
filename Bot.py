@@ -1,155 +1,380 @@
 import asyncio
+import html
 import json
 import logging
 import os
-import urllib.parse
-import requests
 import random
 import re
-import feedparser
-import aiohttp
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import aiohttp
+import feedparser
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters import ChatMemberUpdatedFilter, Command, JOIN_TRANSITION
+from aiogram.types import (
+    ChatMemberUpdated,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated, FSInputFile
-from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
-from aiogram.enums import ParseMode
 
-# === ЗАВАНТАЖЕННЯ ЗМІННИХ СЕРЕДОВИЩА ===
+# ============================================================
+# CONFIG
+# ============================================================
+
 load_dotenv()
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 COC_TOKEN = os.getenv("COC_TOKEN")
-CLAN_TAG = os.getenv("CLAN_TAG", "#2PGVU889Q")
-THREAD_ID = int(os.getenv("THREAD_ID", "14128"))
+CLAN_TAG = os.getenv("CLAN_TAG", "#2PGVU889Q").strip().upper()
+if not CLAN_TAG.startswith("#"):
+    CLAN_TAG = "#" + CLAN_TAG
+
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
-NEWS_THREAD_ID = 4026
-YOUTUBE_CHANNEL_ID = "UCekeHLY2xpfjcGq_3gHFaTA"  # Канал SALOMON
+THREAD_ID = int(os.getenv("THREAD_ID", "14128"))
+NEWS_THREAD_ID = int(os.getenv("NEWS_THREAD_ID", "4026"))
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCekeHLY2xpfjcGq_3gHFaTA")
+BOT_TIMEZONE_NAME = os.getenv("BOT_TIMEZONE", "Europe/Kyiv")
+CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "300")))
+HTTP_TIMEOUT_SECONDS = max(5, int(os.getenv("HTTP_TIMEOUT_SECONDS", "12")))
 
 if not TG_TOKEN or not COC_TOKEN:
     raise ValueError("⚠️ Помилка: TG_TOKEN або COC_TOKEN не знайдено у файлі .env!")
 
-HEADERS = {"Authorization": f"Bearer {COC_TOKEN}"}
-ENCODED_TAG = urllib.parse.quote(CLAN_TAG)
+try:
+    BOT_TIMEZONE = ZoneInfo(BOT_TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    logging.warning("Невідомий часовий пояс %s, використовую UTC", BOT_TIMEZONE_NAME)
+    BOT_TIMEZONE = timezone.utc
 
-PLAYERS_FILE = "players.json"
-STATE_FILE = "bot_state.json"
-LEAGUES_FILE = "players_leagues.json"
-HISTORY_FILE = "history.json"
+ENCODED_TAG = urllib.parse.quote(CLAN_TAG, safe="")
+
+BASE_DIR = Path(__file__).resolve().parent
+PLAYERS_FILE = BASE_DIR / "players.json"
+STATE_FILE = BASE_DIR / "bot_state.json"
+LEAGUES_FILE = BASE_DIR / "players_leagues.json"
+HISTORY_FILE = BASE_DIR / "history.json"
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
-def load_json(filepath, default):
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
+
+# ============================================================
+# JSON / STATE HELPERS
+# ============================================================
+
+
+def load_json(filepath: Path, default: Any) -> Any:
+    try:
+        if filepath.exists():
+            with filepath.open("r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            return default
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.error("Не вдалося прочитати %s: %s", filepath.name, exc)
     return default
 
-def save_json(filepath, data):
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def record_player_stats(player_tag, player_name, event_type, attacks_done, attacks_max):
+def save_json(filepath: Path, data: Any) -> None:
+    """Atomic-ish save: write temp file, then replace original."""
+    tmp = filepath.with_suffix(filepath.suffix + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, filepath)
+    except OSError as exc:
+        logging.error("Не вдалося зберегти %s: %s", filepath.name, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+player_links: dict[str, int | str] = load_json(PLAYERS_FILE, {})
+bot_state: dict[str, Any] = load_json(STATE_FILE, {})
+
+
+def state_once(key: str) -> bool:
+    return bool(bot_state.get(key, False))
+
+
+def mark_state(key: str, value: Any = True) -> None:
+    bot_state[key] = value
+    save_json(STATE_FILE, bot_state)
+
+
+def record_event_stats(
+    event_type: str,
+    rows: list[tuple[str, str, int, int]],
+    event_time: Optional[datetime] = None,
+) -> None:
+    """Record one completed event in history.json with a single disk write."""
     history = load_json(HISTORY_FILE, {})
-    month_key = datetime.now().strftime("%Y-%m")
-    
-    if month_key not in history:
-        history[month_key] = {}
-        
-    if player_tag not in history[month_key]:
-        history[month_key][player_tag] = {
-            "name": player_name,
-            "cw_done": 0, "cw_missed": 0,
-            "cwl_done": 0, "cwl_missed": 0,
-            "raid_done": 0, "raid_missed": 0
-        }
-    
-    p = history[month_key][player_tag]
-    p["name"] = player_name
-    missed = max(0, attacks_max - attacks_done)
-    
-    if event_type == "cw":
-        p["cw_done"] += attacks_done
-        p["cw_missed"] += missed
-    elif event_type == "cwl":
-        p["cwl_done"] += attacks_done
-        p["cwl_missed"] += missed
-    elif event_type == "raid":
-        p["raid_done"] += attacks_done
-        p["raid_missed"] += missed
-        
+    dt = event_time or datetime.now(timezone.utc)
+    month_key = dt.astimezone(BOT_TIMEZONE).strftime("%Y-%m")
+    month = history.setdefault(month_key, {})
+
+    for player_tag, player_name, attacks_done, attacks_max in rows:
+        if not player_tag:
+            continue
+
+        p = month.setdefault(
+            player_tag,
+            {
+                "name": player_name or "Гравець",
+                "cw_done": 0,
+                "cw_missed": 0,
+                "cwl_done": 0,
+                "cwl_missed": 0,
+                "raid_done": 0,
+                "raid_missed": 0,
+            },
+        )
+        p["name"] = player_name or p.get("name", "Гравець")
+        missed = max(0, attacks_max - attacks_done)
+
+        if event_type == "cw":
+            p["cw_done"] = p.get("cw_done", 0) + attacks_done
+            p["cw_missed"] = p.get("cw_missed", 0) + missed
+        elif event_type == "cwl":
+            p["cwl_done"] = p.get("cwl_done", 0) + attacks_done
+            p["cwl_missed"] = p.get("cwl_missed", 0) + missed
+        elif event_type == "raid":
+            p["raid_done"] = p.get("raid_done", 0) + attacks_done
+            p["raid_missed"] = p.get("raid_missed", 0) + missed
+
     save_json(HISTORY_FILE, history)
 
-player_links = load_json(PLAYERS_FILE, {})
-bot_state = load_json(STATE_FILE, {
-    "last_war_state": "",
-    "war_3h_reminded": False,
-    "last_raid_state": "",
-    "raid_24h_reminded": False,
-    "clan_games_reminded": False
-})
+
+# ============================================================
+# CLASH OF CLANS API
+# ============================================================
+
+
+class ClashClient:
+    def __init__(self, token: str):
+        self.token = token
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def start(self) -> None:
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def get(self, endpoint: str) -> Optional[dict[str, Any]]:
+        await self.start()
+        assert self.session is not None
+
+        url = f"https://api.clashofclans.com/v1/{endpoint}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        for attempt in range(3):
+            try:
+                async with self.session.get(url, headers=headers) as res:
+                    if res.status == 200:
+                        return await res.json()
+                    if res.status == 404:
+                        return None
+
+                    body = await res.text()
+                    if res.status == 429 or 500 <= res.status < 600:
+                        wait_seconds = 1 + attempt * 2
+                        logging.warning(
+                            "CoC API [%s], повтор через %sс: %s",
+                            res.status,
+                            wait_seconds,
+                            body[:300],
+                        )
+                        await asyncio.sleep(wait_seconds)
+                        continue
+
+                    logging.error("CoC API [%s]: %s", res.status, body[:500])
+                    return None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt == 2:
+                    logging.error("Помилка з'єднання з CoC API: %s", exc)
+                    return None
+                await asyncio.sleep(1 + attempt * 2)
+
+        return None
+
+
+clash = ClashClient(COC_TOKEN)
+
+
+def encode_tag(tag: str) -> str:
+    return urllib.parse.quote(tag.strip().upper(), safe="")
+
+
+def normalize_tag(tag: str) -> str:
+    tag = urllib.parse.unquote(tag.strip()).upper()
+    if not tag.startswith("#"):
+        tag = "#" + tag
+    return tag
+
+
+def parse_coc_time(time_str: Optional[str]) -> Optional[datetime]:
+    if not time_str:
+        return None
+    clean = time_str.strip().rstrip("Z").split(".")[0]
+    try:
+        return datetime.strptime(clean, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        logging.warning("Невідомий формат часу CoC: %s", time_str)
+        return None
+
+
+def our_and_opponent(war: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    clan = war.get("clan", {}) or {}
+    opponent = war.get("opponent", {}) or {}
+
+    if clan.get("tag") == CLAN_TAG:
+        return clan, opponent
+    if opponent.get("tag") == CLAN_TAG:
+        return opponent, clan
+    return None, None
+
+
+def war_result_text(our_clan: dict[str, Any], opp_clan: dict[str, Any]) -> str:
+    our_stars = our_clan.get("stars", 0)
+    opp_stars = opp_clan.get("stars", 0)
+    our_dest = float(our_clan.get("destructionPercentage", 0) or 0)
+    opp_dest = float(opp_clan.get("destructionPercentage", 0) or 0)
+
+    if our_stars > opp_stars or (our_stars == opp_stars and our_dest > opp_dest):
+        return "🎉 <b>Ми перемогли!</b> 🏆"
+    if our_stars < opp_stars or (our_stars == opp_stars and our_dest < opp_dest):
+        return "💔 <b>На жаль, ми програли...</b> ⚔️"
+    return "🤝 <b>Нічия!</b> ⚔️"
+
+
+# ============================================================
+# TEXT / TELEGRAM HELPERS
+# ============================================================
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value), quote=False)
+
 
 def format_mention(tag: str, name: str) -> str:
-    tag_clean = tag.upper()
-    if tag_clean in player_links:
-        user_ref = player_links[tag_clean]
-        if isinstance(user_ref, int) or (isinstance(user_ref, str) and user_ref.isdigit()):
-            return f'<a href="tg://user?id={user_ref}">{name}</a>'
-        elif isinstance(user_ref, str) and user_ref.startswith("@"):
-            return user_ref
-    return name
+    tag_clean = (tag or "").upper()
+    safe_name = esc(name or "Гравець")
+    user_ref = player_links.get(tag_clean)
 
-def get_clash_data(endpoint: str):
-    url = f"https://api.clashofclans.com/v1/{endpoint}"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        if res.status_code == 200:
-            return res.json()
-        elif res.status_code == 404:
-            return None
+    if isinstance(user_ref, int) or (isinstance(user_ref, str) and user_ref.isdigit()):
+        return f'<a href="tg://user?id={user_ref}">{safe_name}</a>'
+    if isinstance(user_ref, str) and user_ref.startswith("@"):
+        return esc(user_ref)
+    return safe_name
+
+
+def topic_kwargs(thread_id: int) -> dict[str, int]:
+    return {"message_thread_id": thread_id} if thread_id else {}
+
+
+async def send_to_topic(chat_id: int, text: str, photo: Optional[str] = None) -> None:
+    kwargs = topic_kwargs(THREAD_ID)
+
+    if photo:
+        photo_path = BASE_DIR / photo
+        if photo_path.exists():
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=FSInputFile(photo_path),
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    **kwargs,
+                )
+                return
+            except Exception as exc:
+                logging.error("Не вдалося надіслати фото %s: %s", photo, exc)
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        **kwargs,
+    )
+
+
+async def answer_html_lines(msg: types.Message, lines: list[str], limit: int = 3900) -> None:
+    """Send long HTML safely by splitting only between complete lines."""
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        candidate = line if not current else current + "\n" + line
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = line
         else:
-            logging.error(f"Помилка API CoC [{res.status_code}]: {res.text}")
-    except Exception as e:
-        logging.error(f"Помилка з'єднання: {e}")
-    return None
+            current = candidate
+    if current:
+        chunks.append(current)
 
-def parse_coc_time(time_str: str) -> datetime:
-    clean_str = time_str.split(".")[0]
-    return datetime.strptime(clean_str, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    for chunk in chunks:
+        await msg.answer(chunk, parse_mode=ParseMode.HTML)
 
-def load_previous_leagues():
+
+async def is_admin(message: types.Message, user_id: Optional[int] = None) -> bool:
+    uid = user_id or message.from_user.id
+    chat_id = message.chat.id if message.chat.type in {"group", "supergroup"} else CHAT_ID
+    if not chat_id:
+        return False
+
     try:
-        with open(LEAGUES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
+        member = await message.bot.get_chat_member(chat_id, uid)
+        return member.status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}
+    except Exception:
+        return False
 
-def save_current_leagues(data):
-    with open(LEAGUES_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
 
-async def process_weekly_league_report():
-    data = get_clash_data(f"clans/{ENCODED_TAG}")
+def recent_enough(event_time: Optional[datetime], hours: float) -> bool:
+    if event_time is None:
+        return True
+    age = (datetime.now(timezone.utc) - event_time).total_seconds() / 3600
+    return -0.25 <= age <= hours
+
+
+# ============================================================
+# WEEKLY LEAGUE REPORT
+# ============================================================
+
+
+def load_previous_leagues() -> dict[str, Any]:
+    return load_json(LEAGUES_FILE, {})
+
+
+def save_current_leagues(data: dict[str, Any]) -> None:
+    save_json(LEAGUES_FILE, data)
+
+
+async def process_weekly_league_report() -> str:
+    data = await clash.get(f"clans/{ENCODED_TAG}")
     if not data or "memberList" not in data:
         return "❌ Не вдалося отримати дані клану."
 
     old_data = load_previous_leagues()
-    new_data = {}
-    player_rows = []
+    new_data: dict[str, Any] = {}
+    player_rows: list[str] = []
 
     for member in data["memberList"]:
-        tag = member.get("tag")
-        raw_name = member.get("name", "Гравець")
-        clean_name = raw_name.replace("*", "").replace("_", "").replace("`", "")
-
+        tag = member.get("tag", "")
+        name = str(member.get("name", "Гравець"))
         raw_league = member.get("league", {}).get("name", "Unranked")
-        trophies = member.get("trophies", 0)
+        trophies = int(member.get("trophies", 0) or 0)
 
         if raw_league == "Legend League":
             if trophies >= 5400:
@@ -161,201 +386,228 @@ async def process_weekly_league_report():
         else:
             league_name = raw_league
 
-        new_data[tag] = {
-            "name": clean_name,
-            "league": league_name,
-            "trophies": trophies,
-        }
+        new_data[tag] = {"name": name, "league": league_name, "trophies": trophies}
 
         if tag in old_data:
             prev_league = old_data[tag].get("league", "Unranked")
-            prev_trophies = old_data[tag].get("trophies", 0)
-
+            prev_trophies = int(old_data[tag].get("trophies", 0) or 0)
             diff = trophies - prev_trophies
-            sign = f"+{diff}" if diff > 0 else f"{diff}"
-
-            if prev_league != league_name:
-                league_str = f"{prev_league} ➔ {league_name}"
-            else:
-                league_str = f"{league_name}"
-
-            player_rows.append(
-                f"▫️ {clean_name:<16}: {league_str:<25} | {trophies:>4} 🏆 ({sign})"
-            )
+            sign = f"+{diff}" if diff > 0 else str(diff)
+            league_str = f"{prev_league} → {league_name}" if prev_league != league_name else league_name
+            player_rows.append(f"{name}: {league_str} | {trophies} 🏆 ({sign})")
         else:
-            player_rows.append(
-                f"▫️ {clean_name:<16}: {league_name:<25} | {trophies:>4} 🏆 (новий гравець)"
-            )
+            player_rows.append(f"{name}: {league_name} | {trophies} 🏆 (новий гравець)")
 
     save_current_leagues(new_data)
+    body = "\n".join(esc(row) for row in player_rows)
+    return f"🏆 <b>Зміни у клані за бойовий тиждень:</b>\n\n<pre>{body}</pre>"
 
-    header = "🏆 *За минулий бойовий тиждень ми маємо наступні зміни у клані:*\n\n```\n"
-    footer = "\n```"
-    return header + "\n".join(player_rows) + footer
 
-# === КОМАНДИ ===
+# ============================================================
+# COMMANDS
+# ============================================================
+
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     history = load_json(HISTORY_FILE, {})
-    month_key = datetime.now().strftime("%Y-%m")
-    
-    if month_key not in history or not history[month_key]:
+    month_key = datetime.now(BOT_TIMEZONE).strftime("%Y-%m")
+    month = history.get(month_key, {})
+
+    if not month:
         await message.answer("📊 За цей місяць ще немає збереженої історії атак.")
         return
 
-    lines = [f"📊 <b>Статистика атак за {month_key}:</b>\n"]
-    
-    for tag, d in history[month_key].items():
-        lines.append(
-            f"👤 <b>{d['name']}</b>\n"
-            f" ├ ⚔️ <b>КВ:</b> зроблено {d['cw_done']} | ❌ пропущено {d['cw_missed']}\n"
-            f" ├ 🏆 <b>ЛВК:</b> зроблено {d['cwl_done']} | ❌ пропущено {d['cwl_missed']}\n"
-            f" └ 🛡️ <b>Рейди:</b> зроблено {d['raid_done']} | ❌ пропущено {d['raid_missed']}\n"
+    lines = [f"📊 <b>Статистика атак за {month_key}:</b>", ""]
+    for _, d in sorted(month.items(), key=lambda item: str(item[1].get("name", "")).lower()):
+        lines.extend(
+            [
+                f"👤 <b>{esc(d.get('name', 'Гравець'))}</b>",
+                f" ├ ⚔️ <b>КВ:</b> зроблено {d.get('cw_done', 0)} | ❌ пропущено {d.get('cw_missed', 0)}",
+                f" ├ 🏆 <b>ЛВК:</b> зроблено {d.get('cwl_done', 0)} | ❌ пропущено {d.get('cwl_missed', 0)}",
+                f" └ 🛡️ <b>Рейди:</b> зроблено {d.get('raid_done', 0)} | ❌ пропущено {d.get('raid_missed', 0)}",
+                "",
+            ]
         )
-        
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await answer_html_lines(message, lines)
+
+
+@dp.message(Command("missedstats"))
+async def cmd_missed_stats(msg: types.Message):
+    """Ranking of missed attacks using reliable bot-recorded history.
+
+    The Clash war log does not expose old member attack details, so reconstructing
+    missed normal-war attacks from the API after the fact would be inaccurate.
+    """
+    history = load_json(HISTORY_FILE, {})
+    month_key = datetime.now(BOT_TIMEZONE).strftime("%Y-%m")
+    month = history.get(month_key, {})
+
+    debtors: list[tuple[int, dict[str, Any]]] = []
+    for d in month.values():
+        total = int(d.get("cw_missed", 0)) + int(d.get("cwl_missed", 0)) + int(d.get("raid_missed", 0))
+        if total:
+            debtors.append((total, d))
+
+    if not debtors:
+        await msg.answer("🎉 За цей місяць у збереженій історії немає пропущених атак.")
+        return
+
+    debtors.sort(key=lambda item: (item[0], str(item[1].get("name", ""))), reverse=True)
+    lines = [f"📊 <b>Пропущені атаки за {month_key}:</b>", ""]
+    for total, p in debtors:
+        details = []
+        if p.get("cw_missed", 0):
+            details.append(f"⚔️ КВ: <b>{p['cw_missed']}</b>")
+        if p.get("cwl_missed", 0):
+            details.append(f"🏆 ЛВК: <b>{p['cwl_missed']}</b>")
+        if p.get("raid_missed", 0):
+            details.append(f"🏰 Рейди: <b>{p['raid_missed']}</b>")
+        lines.append(f"• <b>{esc(p.get('name', 'Гравець'))}</b> ({total}): " + ", ".join(details))
+
+    await answer_html_lines(msg, lines)
+
 
 @dp.message(Command("start", "help"))
 async def cmd_start(msg: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⚔️ Стан КВ", callback_data="btn_war"),
-            InlineKeyboardButton(text="🏹 Рейди", callback_data="btn_raid")
-        ],
-        [
-            InlineKeyboardButton(text="🏆 CWL", callback_data="btn_cwl"),
-            InlineKeyboardButton(text="📊 Тижневий звіт", callback_data="btn_weekly")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⚔️ Стан КВ", callback_data="btn_war"),
+                InlineKeyboardButton(text="🏹 Рейди", callback_data="btn_raid"),
+            ],
+            [
+                InlineKeyboardButton(text="🏆 CWL", callback_data="btn_cwl"),
+                InlineKeyboardButton(text="📊 Тижневий звіт", callback_data="btn_weekly"),
+            ],
         ]
-    ])
-
-    photo = FSInputFile("23.jpg")
-    await msg.answer_photo(
-        photo=photo,
-        caption=(
-        "Привіт! Я помічник Саурона 🏰\n\n"
-        "Ось що ти можеш вибрати:\n"
-        "• `/link #ТЕГ_ГРАВЦЯ` — Прив'язати Telegram до акаунта (адмінам: реплай + `/link #ТЕГ`)\n"
-        "• `/unlink` — Видалити прив'язку (через реплай або `/unlink #ТЕГ`)\n"
-        "• `/listlinks` — Список усіх прив'язаних акаунтів (адмінам)\n"
-        "• `/player (нік або тег)` — Картка гравця (ТН, кубки, донат)\n"
-        "• `/war` — Стан поточної війни (КВ)\n"
-        "• `/raid` — Звіт по рейд-вікенду\n"
-        "• `/raidstats` — Підсумки останнього рейду (золото, боржники)\n"
-        "• `/cwl` — Звіт по Війнах Ліги\n"
-        "• `/stats` — Статистика гравців по усіх івентах за місяць\n"
-        "• `/weekly_report` — Звіт за тиждень (кубки та ліги)\n"
-        "Обирай потрібну дію кнопками нижче або вводь команди вручну!"
-        ),
-        reply_markup=kb,
-        parse_mode="HTML"
     )
 
-@dp.callback_query()
-async def process_callback_buttons(callback: types.CallbackQuery):
-    code = callback.data
-    if code == "btn_war":
-        await cmd_war(callback.message)
-    elif code == "btn_raid":
-        await cmd_raid(callback.message)
-    elif code == "btn_cwl":
-        await cmd_cwl(callback.message)
-    elif code == "btn_weekly":
-        report = await process_weekly_league_report()
-        await callback.message.answer(report, parse_mode=ParseMode.MARKDOWN)
-    
-    await callback.answer()
+    text = (
+        "Привіт! Я помічник Саурона 🏰\n\n"
+        "Ось що ти можеш вибрати:\n"
+        "• <code>/link #ТЕГ_ГРАВЦЯ</code> — прив'язати Telegram до акаунта\n"
+        "• <code>/unlink</code> — видалити свої прив'язки\n"
+        "• <code>/listlinks</code> — список прив'язок (адмінам)\n"
+        "• <code>/player нік_або_тег</code> — картка гравця\n"
+        "• <code>/war</code> — стан поточної КВ\n"
+        "• <code>/raid</code> — стан рейд-вікенду\n"
+        "• <code>/raidstats</code> — підсумки останнього рейду\n"
+        "• <code>/cwl</code> — стан ЛВК\n"
+        "• <code>/stats</code> — накопичена статистика за місяць\n"
+        "• <code>/missedstats</code> — рейтинг пропущених атак\n"
+        "• <code>/weekly_report</code> — звіт по кубках та лігах\n\n"
+        "Обирай кнопками нижче або вводь команди вручну!"
+    )
 
-async def is_admin(message: types.Message) -> bool:
-    if message.chat.type == 'private':
-        return True 
-    try:
-        member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
-        return member.status in ['creator', 'administrator']
-    except Exception:
-        return False
+    photo = BASE_DIR / "23.jpg"
+    if photo.exists():
+        try:
+            await msg.answer_photo(
+                photo=FSInputFile(photo),
+                caption=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception as exc:
+            logging.warning("Не вдалося відправити 23.jpg: %s", exc)
+
+    await msg.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data.in_({"btn_war", "btn_raid", "btn_cwl", "btn_weekly"}))
+async def process_callback_buttons(callback: types.CallbackQuery):
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    if callback.data == "btn_war":
+        await cmd_war(callback.message)
+    elif callback.data == "btn_raid":
+        await cmd_raid(callback.message)
+    elif callback.data == "btn_cwl":
+        await cmd_cwl(callback.message)
+    elif callback.data == "btn_weekly":
+        report = await process_weekly_league_report()
+        await callback.message.answer(report, parse_mode=ParseMode.HTML)
+
+    await callback.answer()
 
 
 @dp.message(Command("link"))
 async def cmd_link(msg: types.Message):
-    args = msg.text.split()
-    target_user_id = msg.from_user.id
-    target_user_name = msg.from_user.first_name
-    
-    admin_mode = await is_admin(msg)
-
-    if admin_mode and msg.reply_to_message:
-        target_user_id = msg.reply_to_message.from_user.id
-        target_user_name = msg.reply_to_message.from_user.first_name
-        player_tag_arg_index = 1
-    else:
-        player_tag_arg_index = 1
-
-    if len(args) <= player_tag_arg_index:
-        await msg.answer("Вкажіть ваш тег. Приклад: <code>/link #2ABC123</code>", parse_mode=ParseMode.HTML)
+    args = (msg.text or "").split()
+    if len(args) < 2:
+        await msg.answer("Вкажіть тег. Приклад: <code>/link #2ABC123</code>", parse_mode=ParseMode.HTML)
         return
 
-    player_tag = args[player_tag_arg_index].upper().replace("%23", "#")
-    if not player_tag.startswith("#"):
-        player_tag = "#" + player_tag
+    target_user = msg.from_user
+    if msg.reply_to_message:
+        if not await is_admin(msg):
+            await msg.answer("❌ Прив'язувати акаунт іншому користувачу може лише адміністратор.")
+            return
+        target_user = msg.reply_to_message.from_user
 
-    player_links[player_tag] = target_user_id
+    player_tag = normalize_tag(args[1])
+    player_links[player_tag] = target_user.id
     save_json(PLAYERS_FILE, player_links)
 
-    mention_html = f'<a href="tg://user?id={target_user_id}">{target_user_name}</a>'
-    
-    try:
-        photo = FSInputFile("22.jpg")
-        await msg.answer_photo(
-            photo=photo,
-            caption=f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨",
-            parse_mode="HTML"
-        )
-    except Exception:
-        await msg.answer(f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨", parse_mode="HTML")
+    mention = f'<a href="tg://user?id={target_user.id}">{esc(target_user.first_name or "користувач")}</a>'
+    caption = f"Чудово! Тег <code>{esc(player_tag)}</code> прив'язано до {mention} ✨"
+
+    photo = BASE_DIR / "22.jpg"
+    if photo.exists():
+        try:
+            await msg.answer_photo(FSInputFile(photo), caption=caption, parse_mode=ParseMode.HTML)
+            return
+        except Exception as exc:
+            logging.warning("Не вдалося відправити 22.jpg: %s", exc)
+
+    await msg.answer(caption, parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("unlink"))
 async def cmd_unlink(msg: types.Message):
-    if not await is_admin(msg):
-        await msg.answer("❌ Ця команда доступна лише адміністраторам.")
-        return
+    args = (msg.text or "").split()
 
-    target_user_id = None
+    # Admin can unlink the user replied to.
     if msg.reply_to_message:
-        target_user_id = msg.reply_to_message.from_user.id
-    else:
-        args = msg.text.split()
-        if len(args) > 1:
-            target_tag = args[1].upper().replace("%23", "#")
-            if not target_tag.startswith("#"):
-                target_tag = "#" + target_tag
-            found_tag = None
-            for tag, uid in player_links.items():
-                if tag.upper() == target_tag:
-                    found_tag = tag
-                    break
-            if found_tag:
-                del player_links[found_tag]
-                save_json(PLAYERS_FILE, player_links)
-                await msg.answer(f"🗑 Прив'язку тегу <code>{found_tag}</code> успішно видалено!", parse_mode="HTML")
-                return
-
-    if not target_user_id:
-        await msg.answer("⚠️ Зробіть реплай (відповідь) на повідомлення користувача або вкажіть тег: <code>/unlink #TAG</code>", parse_mode="HTML")
+        if not await is_admin(msg):
+            await msg.answer("❌ Видаляти прив'язки іншого користувача може лише адміністратор.")
+            return
+        target_uid = msg.reply_to_message.from_user.id
+        found = [tag for tag, uid in player_links.items() if str(uid) == str(target_uid)]
+        for tag in found:
+            player_links.pop(tag, None)
+        save_json(PLAYERS_FILE, player_links)
+        await msg.answer("🗑 Усі прив'язки цього користувача видалено." if found else "❌ Прив'язок не знайдено.")
         return
 
-    found_tags = [tag for tag, uid in player_links.items() if uid == target_user_id]
-    
-    if not found_tags:
-        await msg.answer("❌ У цього користувача немає прив'язаних тегів.")
+    # Explicit tag: owner can unlink own tag; admin can unlink any tag.
+    if len(args) > 1:
+        tag = normalize_tag(args[1])
+        owner = player_links.get(tag)
+        if owner is None:
+            await msg.answer("❌ Такої прив'язки не знайдено.")
+            return
+        if str(owner) != str(msg.from_user.id) and not await is_admin(msg):
+            await msg.answer("❌ Це не ваша прив'язка.")
+            return
+        player_links.pop(tag, None)
+        save_json(PLAYERS_FILE, player_links)
+        await msg.answer(f"🗑 Прив'язку <code>{esc(tag)}</code> видалено.", parse_mode=ParseMode.HTML)
         return
 
-    for tag in found_tags:
-        del player_links[tag]
-    
+    # No args: unlink all own tags.
+    own_tags = [tag for tag, uid in player_links.items() if str(uid) == str(msg.from_user.id)]
+    if not own_tags:
+        await msg.answer("❌ У вас немає прив'язаних тегів.")
+        return
+    for tag in own_tags:
+        player_links.pop(tag, None)
     save_json(PLAYERS_FILE, player_links)
-    await msg.answer("🗑 Усі прив'язки цього користувача успішно видалено!")
+    await msg.answer("🗑 Усі ваші прив'язки видалено.")
 
 
 @dp.message(Command("listlinks"))
@@ -364,946 +616,850 @@ async def cmd_listlinks(msg: types.Message):
         await msg.answer("❌ Ця команда доступна лише адміністраторам.")
         return
 
-    try:
-        with open(PLAYERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = player_links
-
-    if not data:
+    if not player_links:
         await msg.answer("📋 Список прив'язаних ігрових акаунтів порожній.")
         return
 
-    user_tags = {}
-    for tag, uid in data.items():
+    user_tags: dict[str, list[str]] = {}
+    for tag, uid in player_links.items():
         user_tags.setdefault(str(uid), []).append(tag)
 
-    text = "📋 <b>Список прив'язаних акаунтів:</b>\n\n"
-
+    lines = ["📋 <b>Список прив'язаних акаунтів:</b>", ""]
     for uid_str, tags in user_tags.items():
         display_name = f"ID: {uid_str}"
+        try:
+            uid = int(uid_str)
+            lookup_chat = msg.chat.id if msg.chat.type in {"group", "supergroup"} else CHAT_ID
+            if lookup_chat:
+                member = await msg.bot.get_chat_member(lookup_chat, uid)
+                user = member.user
+                display_name = f"@{user.username}" if user.username else (user.first_name or display_name)
+        except Exception:
+            pass
 
-        clean_id = uid_str.lstrip('-')
-        if clean_id.isdigit():
-            try:
-                member = await msg.bot.get_chat_member(msg.chat.id, int(uid_str))
-                u = member.user
-                display_name = f"@{u.username}" if u.username else (u.first_name or display_name)
-            except Exception:
-                pass
+        tags_str = ", ".join(f"<code>{esc(tag)}</code>" for tag in sorted(tags))
+        lines.extend([f"👤 <b>{esc(display_name)}</b>:", f"└ Теги: {tags_str}", ""])
 
-        tags_str = ", ".join([f"<code>{t}</code>" for t in tags])
-        text += f"👤 <b>{display_name}</b>:\n└ Теги: {tags_str}\n\n"
+    await answer_html_lines(msg, lines)
 
-    if len(text) > 4096:
-        text = text[:4090] + "..."
-
-    await msg.answer(text, parse_mode="HTML")
 
 @dp.message(Command("war"))
 async def cmd_war(msg: types.Message):
-    if msg.message_thread_id and msg.message_thread_id != THREAD_ID:
+    if msg.message_thread_id and THREAD_ID and msg.message_thread_id != THREAD_ID:
         return
 
-    data = get_clash_data(f"clans/{ENCODED_TAG}/currentwar")
-    if not data:
+    war = await clash.get(f"clans/{ENCODED_TAG}/currentwar")
+    if not war:
         await msg.answer("❌ Не вдалося отримати дані про війну.")
         return
 
-    state = data.get("state")
+    state = war.get("state")
     if state == "notInWar":
         await msg.answer("⚔️ Клан зараз не перебуває у війні.")
         return
 
-    opponent_name = data.get("opponent", {}).get("name", "Невідомо")
+    our_clan, opp_clan = our_and_opponent(war)
+    if not our_clan or not opp_clan:
+        await msg.answer("❌ API повернув війну, але наш клан у ній не знайдено.")
+        return
+
+    opponent_name = esc(opp_clan.get("name", "Невідомо"))
+    attack_limit = int(war.get("attacksPerMember", 2) or 2)
 
     if state == "preparation":
-        await msg.answer(f"⏳ Триває день підготовки до війни проти «<b>{opponent_name}</b>»!", parse_mode=ParseMode.HTML)
-    elif state == "inWar":
-        clan_stars = data.get("clan", {}).get("stars", 0)
-        opp_stars = data.get("opponent", {}).get("stars", 0)
-        
-        clan_members = data.get("clan", {}).get("members", [])
-        unattacked = []
+        await msg.answer(
+            f"⏳ Триває день підготовки до війни проти «<b>{opponent_name}</b>»!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
-        for m in clan_members:
-            attacks = m.get("attacks", [])
-            cnt = len(attacks)
-            if cnt < 2:
-                tag = m.get("tag", "")
-                name = m.get("name", "Гравець")
-                mention = format_mention(tag, name)
-                unattacked.append(f"• {mention} — {cnt}/2 ⚔️")
+    our_stars = our_clan.get("stars", 0)
+    opp_stars = opp_clan.get("stars", 0)
+
+    if state == "inWar":
+        unattacked = []
+        for member in our_clan.get("members", []):
+            count = len(member.get("attacks", []))
+            if count < attack_limit:
+                unattacked.append(
+                    f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} — {count}/{attack_limit} ⚔️"
+                )
 
         text = (
             f"⚔️ Ми воюємо з «<b>{opponent_name}</b>»!\n"
-            f"⭐ Зірки: <b>{clan_stars}</b> — <b>{opp_stars}</b>\n\n"
+            f"⭐ Зірки: <b>{our_stars}</b> — <b>{opp_stars}</b>\n\n"
         )
-
-        if unattacked:
-            text += "⚠️ <b>Ще не зробили всі атаки:</b>\n" + "\n".join(unattacked)
-        else:
-            text += "🎉 Усі учасники зробили свої 2 атаки!"
-
+        text += (
+            "⚠️ <b>Ще не зробили всі атаки:</b>\n" + "\n".join(unattacked)
+            if unattacked
+            else f"🎉 Усі учасники зробили свої {attack_limit} атаки!"
+        )
         await msg.answer(text, parse_mode=ParseMode.HTML)
+        return
 
-    elif state == "warEnded":
-        clan_stars = data.get("clan", {}).get("stars", 0)
-        opp_stars = data.get("opponent", {}).get("stars", 0)
-        clan_dest = data.get("clan", {}).get("destructionPercentage", 0)
-        opp_dest = data.get("opponent", {}).get("destructionPercentage", 0)
-
-        if clan_stars > opp_stars:
-            res_str = "🎉 Перемога!"
-        elif clan_stars < opp_stars:
-            res_str = "💔 Поразка..."
-        else:
-            if clan_dest > opp_dest:
-                res_str = "🎉 Перемога за відсотками!"
-            elif clan_dest < opp_dest:
-                res_str = "💔 Поразка за відсотками..."
-            else:
-                res_str = "🤝 Бойова нічия!"
-
-        clan_members = data.get("clan", {}).get("members", [])
+    if state == "warEnded":
+        our_dest = float(our_clan.get("destructionPercentage", 0) or 0)
+        opp_dest = float(opp_clan.get("destructionPercentage", 0) or 0)
         not_full = []
-        for m in clan_members:
-            attacks = m.get("attacks", [])
-            cnt = len(attacks)
-            stars = sum(a.get("stars", 0) for a in attacks)
-            if cnt < 2:
-                mention = format_mention(m["tag"], m["name"])
-                not_full.append(f"• {mention} — {cnt}/2 атак ⚔️ ({stars} ⭐)")
+        for member in our_clan.get("members", []):
+            attacks = member.get("attacks", [])
+            count = len(attacks)
+            stars = sum(int(a.get("stars", 0) or 0) for a in attacks)
+            if count < attack_limit:
+                not_full.append(
+                    f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} — {count}/{attack_limit} атак ⚔️ ({stars} ⭐)"
+                )
 
         text = (
             f"🏁 Війна проти «<b>{opponent_name}</b>» завершилася.\n"
-            f"Результат: <b>{res_str}</b>\n"
-            f"⭐ Зірки: <b>{clan_stars}</b> — <b>{opp_stars}</b>\n"
-            f"💥 Руйнування: <b>{clan_dest:.1f}%</b> — <b>{opp_dest:.1f}%</b>\n\n"
+            f"{war_result_text(our_clan, opp_clan)}\n"
+            f"⭐ Зірки: <b>{our_stars}</b> — <b>{opp_stars}</b>\n"
+            f"💥 Руйнування: <b>{our_dest:.1f}%</b> — <b>{opp_dest:.1f}%</b>\n\n"
         )
-
-        if not_full:
-            text += "⚠️ <b>Не зробили всі атаки:</b>\n" + "\n".join(not_full)
-        else:
-            text += "🎉 Усі зробили свої атаки! Молодці!"
-
+        text += (
+            "⚠️ <b>Не зробили всі атаки:</b>\n" + "\n".join(not_full)
+            if not_full
+            else "🎉 Усі зробили свої атаки! Молодці!"
+        )
         await msg.answer(text, parse_mode=ParseMode.HTML)
+
 
 @dp.message(Command("test_league"))
 async def cmd_test_league(msg: types.Message):
-    data = get_clash_data(f"clans/{ENCODED_TAG}")
-    if not data or "memberList" not in data:
+    data = await clash.get(f"clans/{ENCODED_TAG}")
+    if not data or not data.get("memberList"):
         await msg.answer("❌ Не вдалося отримати дані.")
         return
-    
     first_member = data["memberList"][0]
-    league_info = first_member.get("league", {})
-    await msg.answer(f"📊 Дані ліги для **{first_member.get('name')}**:\n`{league_info}`", parse_mode=ParseMode.MARKDOWN)
+    await msg.answer(
+        f"📊 Дані ліги для <b>{esc(first_member.get('name', 'Гравець'))}</b>:\n"
+        f"<code>{esc(first_member.get('league', {}))}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
 
 @dp.message(Command("weekly_report"))
 async def cmd_weekly_report(msg: types.Message):
     report = await process_weekly_league_report()
-    await msg.answer(report, parse_mode=ParseMode.MARKDOWN)
+    await msg.answer(report, parse_mode=ParseMode.HTML)
+
 
 @dp.message(Command("raid"))
 async def cmd_raid(msg: types.Message):
-    data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
-    if not data or "items" not in data or not data["items"]:
+    data = await clash.get(f"clans/{ENCODED_TAG}/capitalraidseasons?limit=1")
+    if not data or not data.get("items"):
         await msg.answer("⚠️ Не вдалося отримати дані про рейди від Supercell.")
         return
-    
+
     current = data["items"][0]
     if current.get("state") != "ongoing":
         await msg.answer("⚔️ Наразі немає активного Рейд-вікенду.")
         return
 
     unfinished = []
-    for m in current.get("members", []):
-        tag = m.get("tag", "")
-        name = m.get("name", "Гравець")
-        used = m.get("attacks", 0)
-        
+    for member in current.get("members", []):
+        used = member.get("attacks", 0)
         if isinstance(used, dict):
             used = used.get("count", 0)
-            
-        limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
-        
+        limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
         if used < limit:
-            unfinished.append(f"• {format_mention(tag, name)} — {used}/{limit} ⚔️")
-    
+            unfinished.append(
+                f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} — {used}/{limit} ⚔️"
+            )
+
     text = "🏹 <b>Поточний стан рейду:</b>\n\n"
-    if unfinished:
-        text += "Гравці, які ще не зробили всі атаки:\n" + "\n".join(unfinished)
-    else:
-        text += "Усі зробили свої атаки! 🎉"
-    
+    text += (
+        "Гравці, які ще не зробили всі атаки:\n" + "\n".join(unfinished)
+        if unfinished
+        else "Усі учасники рейду зробили свої атаки! 🎉"
+    )
     await msg.answer(text, parse_mode=ParseMode.HTML)
+
+
+async def find_current_cwl_war(group_data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    for round_data in reversed(group_data.get("rounds", [])):
+        for war_tag in round_data.get("warTags", []):
+            if war_tag == "#0":
+                continue
+            war = await clash.get(f"clanwarleagues/wars/{encode_tag(war_tag)}")
+            if not war:
+                continue
+            our_clan, _ = our_and_opponent(war)
+            if our_clan and war.get("state") in {"preparation", "inWar"}:
+                return war
+    return None
+
 
 @dp.message(Command("cwl"))
 async def cmd_cwl(msg: types.Message):
-    if msg.message_thread_id and msg.message_thread_id != THREAD_ID:
+    if msg.message_thread_id and THREAD_ID and msg.message_thread_id != THREAD_ID:
         return
 
-    group_data = get_clash_data(f"clans/{ENCODED_TAG}/currentwar/leaguegroup")
+    group_data = await clash.get(f"clans/{ENCODED_TAG}/currentwar/leaguegroup")
     if not group_data or group_data.get("state") == "notInWar":
         await msg.answer("⚔️ Клан зараз не перебуває у Лізі Війн Кланів (CWL).")
         return
 
-    rounds = group_data.get("rounds", [])
-    current_war_tag = None
-
-    for r in reversed(rounds):
-        war_tags = r.get("warTags", [])
-        for w_tag in war_tags:
-            if w_tag != "#0":
-                war_info = get_clash_data(f"clanwarleagues/wars/{urllib.parse.quote(w_tag)}")
-                if war_info and (
-                    war_info.get("clan", {}).get("tag") == CLAN_TAG
-                    or war_info.get("opponent", {}).get("tag") == CLAN_TAG
-                ):
-                    if war_info.get("state") in ["inWar", "preparation"]:
-                        current_war_tag = w_tag
-                        break
-        if current_war_tag:
-            break
-
-    if not current_war_tag:
+    war = await find_current_cwl_war(group_data)
+    if not war:
         await msg.answer("📊 Активних раундів CWL наразі не знайдено.")
         return
 
-    war_data = get_clash_data(f"clanwarleagues/wars/{urllib.parse.quote(current_war_tag)}")
-    if not war_data:
-        await msg.answer("❌ Не вдалося отримати дані раунду CWL.")
+    our_clan, opp_clan = our_and_opponent(war)
+    if not our_clan or not opp_clan:
+        await msg.answer("❌ Не вдалося визначити сторони поточного раунду CWL.")
         return
 
-    state = war_data.get("state")
-    is_our_clan_first = war_data.get("clan", {}).get("tag") == CLAN_TAG
-    our_clan = war_data.get("clan") if is_our_clan_first else war_data.get("opponent")
-    opp_clan = war_data.get("opponent") if is_our_clan_first else war_data.get("clan")
-
-    opp_name = opp_clan.get("name", "Суперник")
-
-    if state == "preparation":
-        await msg.answer(f"⏳ **CWL**: Триває підготовка до раунду проти **{opp_name}**!", parse_mode=ParseMode.MARKDOWN)
+    opponent_name = esc(opp_clan.get("name", "Суперник"))
+    if war.get("state") == "preparation":
+        await msg.answer(
+            f"⏳ <b>CWL:</b> триває підготовка до раунду проти <b>{opponent_name}</b>!",
+            parse_mode=ParseMode.HTML,
+        )
         return
-
-    our_stars = our_clan.get("stars", 0)
-    opp_stars = opp_clan.get("stars", 0)
 
     unattacked = []
     for member in our_clan.get("members", []):
-        attacks = member.get("attacks", [])
-        if not attacks:
-            unattacked.append(format_mention(member.get("tag"), member.get("name")))
+        if not member.get("attacks", []):
+            unattacked.append(format_mention(member.get("tag", ""), member.get("name", "Гравець")))
 
     text = (
-        f"🏆 **Ліга Війн Кланів (CWL)**\n"
-        f"⚔️ Проти: **{opp_name}**\n"
-        f"⭐ Зірки: **{our_stars}** — **{opp_stars}**\n\n"
+        "🏆 <b>Ліга Війн Кланів (CWL)</b>\n"
+        f"⚔️ Проти: <b>{opponent_name}</b>\n"
+        f"⭐ Зірки: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n\n"
     )
-
-    if unattacked:
-        text += "⚠️ **Ще не зробили атаку:**\n" + "\n".join([f"• {m}" for m in unattacked])
-    else:
-        text += "🎉 Усі учасники зробили свої атаки!"
-
+    text += (
+        "⚠️ <b>Ще не зробили атаку:</b>\n" + "\n".join(f"• {name}" for name in unattacked)
+        if unattacked
+        else "🎉 Усі учасники зробили свої атаки!"
+    )
     await msg.answer(text, parse_mode=ParseMode.HTML)
+
 
 @dp.message(Command("player"))
 async def cmd_player_stats(msg: types.Message):
-    args = msg.text.split(maxsplit=1)
+    args = (msg.text or "").split(maxsplit=1)
     if len(args) < 2:
         await msg.answer("❌ Вкажіть тег або ім'я гравця. Приклад:\n/player #QV2JL9G08 або /player Саурон")
         return
 
     query = args[1].strip()
-    player_tag = None
+    player_tag: Optional[str] = None
 
-    if query.startswith("#"):
-        player_tag = query
+    if query.startswith("#") or query.upper().startswith("%23"):
+        player_tag = normalize_tag(query)
     else:
-        clan_data = get_clash_data(f"clans/{ENCODED_TAG}")
-        if clan_data and "memberList" in clan_data:
-            for m in clan_data["memberList"]:
-                if query.lower() in m.get("name", "").lower():
-                    player_tag = m.get("tag")
-                    break
+        clan_data = await clash.get(f"clans/{ENCODED_TAG}")
+        members = clan_data.get("memberList", []) if clan_data else []
+        exact = [m for m in members if str(m.get("name", "")).lower() == query.lower()]
+        partial = [m for m in members if query.lower() in str(m.get("name", "")).lower()]
+        match = exact[0] if exact else (partial[0] if partial else None)
+        if match:
+            player_tag = match.get("tag")
 
     if not player_tag:
-        await msg.answer(f"❌ Гравця «{query}» не знайдено в клані.")
+        await msg.answer(f"❌ Гравця «{esc(query)}» не знайдено в клані.", parse_mode=ParseMode.HTML)
         return
 
-    encoded_player_tag = player_tag.replace("#", "%23")
-    p_data = get_clash_data(f"players/{encoded_player_tag}")
-
+    p_data = await clash.get(f"players/{encode_tag(player_tag)}")
     if not p_data:
         await msg.answer("❌ Не вдалося отримати дані гравця з Supercell API.")
         return
 
-    p_name = p_data.get("name", "Невідомо")
-    th = p_data.get("townHallLevel", "?")
-    trophies = p_data.get("trophies", 0)
-    best_trophies = p_data.get("bestTrophies", 0)
-    exp = p_data.get("expLevel", 0)
-    role = p_data.get("role", "member").capitalize()
-    donations = p_data.get("donations", 0)
-    donations_rec = p_data.get("donationsReceived", 0)
-    war_stars = p_data.get("warStars", 0)
+    name = esc(p_data.get("name", "Невідомо"))
+    trophies = int(p_data.get("trophies", 0) or 0)
     raw_league = p_data.get("league", {}).get("name", "Unranked")
     if raw_league == "Legend League":
         if trophies >= 5400:
-            league_info = "Legend League I"
+            league_name = "Legend League I"
         elif trophies >= 5200:
-            league_info = "Legend League II"
+            league_name = "Legend League II"
         else:
-            league_info = "Legend League III"
+            league_name = "Legend League III"
     else:
-        league_info = raw_league
+        league_name = raw_league
 
     text = (
-        f"👤 Інформація про гравця: {p_name}\n"
-        f"🏷 Тег: {p_data.get('tag')}\n"
-        f"🏰 Ратуша (TH): {th}\n"
-        f"⭐ Рівень: {exp}\n"
-        f"🛡 Посада в клані: {role}\n\n"
-        f"🏆 Кубки: {trophies} (Рекорд: {best_trophies})\n"
-        f"🏅 Ліга: {league_info}\n"
-        f"⚔️ Зірки на війні: {war_stars}\n\n"
-        f"🤲 Донат: {donations} / Отримано: {donations_rec}"
-    )
-    
-    random_images = ["1.jpg", "2.jpg", "3.jpg","4.jpg","5.jpg","6.jpg","7.jpg","8.jpg","9.jpg","10.jpg","11.jpg","12.jpg"]
-    chosen_image = random.choice(random_images)
-    
-    photo = FSInputFile(chosen_image)
-    await msg.answer_photo(
-        photo=photo,
-        caption=text,
-        parse_mode="HTML"
+        f"👤 Інформація про гравця: <b>{name}</b>\n"
+        f"🏷 Тег: <code>{esc(p_data.get('tag', player_tag))}</code>\n"
+        f"🏰 Ратуша (TH): {p_data.get('townHallLevel', '?')}\n"
+        f"⭐ Рівень: {p_data.get('expLevel', 0)}\n"
+        f"🛡 Посада в клані: {esc(str(p_data.get('role', 'member')).capitalize())}\n\n"
+        f"🏆 Кубки: {trophies} (Рекорд: {p_data.get('bestTrophies', 0)})\n"
+        f"🏅 Ліга: {esc(league_name)}\n"
+        f"⚔️ Зірки на війні: {p_data.get('warStars', 0)}\n\n"
+        f"🤲 Донат: {p_data.get('donations', 0)} / Отримано: {p_data.get('donationsReceived', 0)}"
     )
 
-# === ВІТАЛЬНИЙ ОБРОБНИК ===
-
-@dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
-async def welcome_new_chat_member(event: ChatMemberUpdated):
-    user_id = event.new_chat_member.user.id
-    user_name = event.new_chat_member.user.first_name
-    
-    mention = f'<a href="tg://user?id={user_id}">{user_name}</a>'
-    
-    welcome_text = (
-        f"Привіт, {mention}! 👋 Вітаємо у нашому чаті! 🏰\n\n"
-        f"Будь ласка, прив'яжи свій Telegram до ігрового профілю в Clash of Clans.\n"
-        f"Для цього напиши команду:\n"
-        f"<code>/link #ТВІЙ_ТЕГ</code> (наприклад, <code>/link #2ABC123</code>)"
-    )
-    
-    await send_to_topic(event.chat.id, welcome_text)
-
-# === АВТО-СПОВІЩЕННЯ У ГІЛКУ ===
-
-async def send_to_topic(chat_id: int, text: str, photo: str | None = None):
-    if photo:
+    images = [BASE_DIR / f"{i}.jpg" for i in range(1, 13)]
+    available = [p for p in images if p.exists()]
+    if available:
         try:
-            photo_file = FSInputFile(photo)
-            await bot.send_photo(
-                chat_id=chat_id,
-                message_thread_id=THREAD_ID,
-                photo=photo_file,
-                caption=text,
-                parse_mode=ParseMode.HTML
-            )
+            await msg.answer_photo(random.choice(available), caption=text, parse_mode=ParseMode.HTML)
             return
-        except Exception as e:
-            logging.error(f"Не вдалося надіслати фото {photo}: {e}")
+        except Exception as exc:
+            logging.warning("Не вдалося відправити картинку гравця: %s", exc)
 
-    await bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=THREAD_ID,
-        text=text,
-        parse_mode=ParseMode.HTML
-    )
+    await msg.answer(text, parse_mode=ParseMode.HTML)
 
-async def check_war_events(chat_id: int):
-    # ================= 1. ЗВИЧАЙНЕ КВ =================
-    war = get_clash_data(f"clans/{ENCODED_TAG}/currentwar")
-    if war and "state" in war:
-        state = war["state"]
-
-        # Початок війни
-        if state == "inWar" and bot_state.get("last_war_state") == "preparation":
-            opponent = war.get("opponent", {}).get("name", "ворога")
-            await send_to_topic(
-                chat_id,
-                f"Почалася війна з <b>{opponent}</b> ⚔️\nНе забувайте зробити 2 атаки. Всім успіхів в атаках 💖\nІ нехай удача завжди буде з вами 🙋‍♂️ 💙",
-                photo="24.jpg"
-            )
-            bot_state["war_3h_reminded"] = False
-            save_json(STATE_FILE, bot_state)
-
-        # Нагадування за 3 години
-        if state == "inWar":
-            end_time = parse_coc_time(war["endTime"])
-            now = datetime.now(timezone.utc)
-            hours_left = (end_time - now).total_seconds() / 3600
-
-            if 0 < hours_left <= 3.5 and not bot_state.get("war_3h_reminded", False):
-                clan_data = war.get("clan", {})
-                unattacked = []
-                for member in clan_data.get("members", []):
-                    attacks = member.get("attacks", [])
-                    cnt = len(attacks)
-                    if cnt < 2:
-                        mention = format_mention(member["tag"], member["name"])
-                        unattacked.append(f"• {mention} ({cnt}/2)")
-
-                if unattacked:
-                    names_str = "\n".join(unattacked)
-                    await send_to_topic(
-                        chat_id,
-                        f"⚠️ <b>Залишилося 3 години до кінця КВ!</b> 🕛\n\n"
-                        f"Гравці, які ще не зробили всі атаки:\n\n{names_str}\n\n"
-                        f"Зробіть, будь ласка, свої атаки! ⚔️"
-                    )
-                bot_state["war_3h_reminded"] = True
-                save_json(STATE_FILE, bot_state)
-
-        # Закінчення звичайного КВ
-        if state == "warEnded" and bot_state.get("last_war_state") == "inWar":
-            opponent_name = war.get("opponent", {}).get("name", "ворогом")
-            my_stars = war.get("clan", {}).get("stars", 0)
-            op_stars = war.get("opponent", {}).get("stars", 0)
-            
-            my_dest = war.get("clan", {}).get("destructionPercentage", 0)
-            op_dest = war.get("opponent", {}).get("destructionPercentage", 0)
-
-            if my_stars > op_stars:
-                res_text = "перемогли 💪🏆"
-            elif my_stars < op_stars:
-                res_text = "програли 💔"
-            else:
-                if my_dest > op_dest:
-                    res_text = f"перемогли за відсотками ({my_dest:.1f}% проти {op_dest:.1f}%) 💪🏆"
-                elif my_dest < op_dest:
-                    res_text = f"програли за відсотками ({my_dest:.1f}% проти {op_dest:.1f}%) 💔"
-                else:
-                    res_text = "зіграли в НІЧИЮ 🤝⚖️"
-            
-            clan_members = war.get("clan", {}).get("members", [])
-            not_full = []
-            for m in clan_members:
-                attacks = m.get("attacks", [])
-                cnt = len(attacks)
-                stars = sum(a.get("stars", 0) for a in attacks)
-                record_player_stats(m.get("tag"), m.get("name"), "cw", cnt, 2)
-                if cnt < 2:
-                    mention = format_mention(m["tag"], m["name"])
-                    not_full.append(f"• {mention} - {cnt}/2 атак ⚔️, {stars} ⭐")
-            
-            msg_text = (
-                f"🏁 Війна проти «<b>{opponent_name}</b>» закінчена.\n"
-                f"Ми {res_text}!\n"
-                f"⭐ Рахунок: <b>{my_stars}</b> — <b>{op_stars}</b>\n\n"
-            )
-            if not_full:
-                msg_text += "⚠️ <b>Гравці, які не зробили всі атаки:</b>\n" + "\n".join(not_full)
-            else:
-                msg_text += "🎉 Усі зробили свої атаки! Молодці!"
-                
-            await send_to_topic(chat_id, msg_text, photo="25.jpg")
-
-        # Зберігаємо стан звичайного КВ
-        bot_state["last_war_state"] = state
-        save_json(STATE_FILE, bot_state)
-
-    # ================= 2. ЛІГА ВІЙН КЛАНІВ (CWL) =================
-    cwl_group = get_clash_data(f"clans/{ENCODED_TAG}/currentwar/leaguegroup")
-    if cwl_group and cwl_group.get("state") == "inWar":
-        rounds = cwl_group.get("rounds", [])
-        for r in rounds:
-            war_tags = r.get("warTags", [])
-            for w_tag in war_tags:
-                if w_tag == "#0":
-                    continue
-                
-                clean_wtag = urllib.parse.quote(w_tag)
-                c_war = get_clash_data(f"clanwarleagues/wars/{clean_wtag}")
-                
-                if not c_war or c_war.get("clan", {}).get("tag") != CLAN_TAG:
-                    continue
-
-                state = c_war.get("state")
-                round_id = c_war.get("endTime")
-
-                if state == "inWar":
-                    end_time = parse_coc_time(c_war.get("endTime"))
-                    now = datetime.now(timezone.utc)
-                    hours_left = (end_time - now).total_seconds() / 3600
-
-                    cwl_start_key = f"cwl_announced_{round_id}"
-                    if not bot_state.get(cwl_start_key, False):
-                        opp_name = c_war.get("opponent", {}).get("name", "суперника")
-                        await send_to_topic(
-                            chat_id,
-                            f"🏆 <b>Розпочався новий день ЛВК проти «{opp_name}»!</b> ⚔️\n\n"
-                            f"Не забувайте зробити свою 1 вирішальну атаку! Успіхів та 3 зірок кожному! 🛡️✨"
-                        )
-                        bot_state[cwl_start_key] = True
-                        save_json(STATE_FILE, bot_state)
-
-                    if 0 < hours_left <= 3.5:
-                        if bot_state.get("last_cwl_round") != round_id:
-                            clan_data = c_war.get("clan", {})
-                            unattacked = []
-                            for member in clan_data.get("members", []):
-                                attacks = member.get("attacks", [])
-                                if len(attacks) < 1:
-                                    mention = format_mention(member["tag"], member["name"])
-                                    unattacked.append(f"• {mention} (0/1)")
-
-                            if unattacked:
-                                names_str = "\n".join(unattacked)
-                                await send_to_topic(
-                                    chat_id,
-                                    f"🏆 <b>Залишилося 3 години до кінця раунду ЛВК!</b> 🕛\n\n"
-                                    f"Гравці, які ще не зробили атаку:\n\n{names_str}\n\n"
-                                    f"Зробіть, будь ласка, свій бій за клан! ⚔️"
-                                )
-                            bot_state["last_cwl_round"] = round_id
-                            save_json(STATE_FILE, bot_state)
-
-                elif state == "warEnded":
-                    cwl_ended_key = f"cwl_ended_{round_id}"
-                    if not bot_state.get(cwl_ended_key, False):
-                        opp_name = c_war.get("opponent", {}).get("name", "суперника")
-                        clan_stars = c_war.get("clan", {}).get("stars", 0)
-                        opp_stars = c_war.get("opponent", {}).get("stars", 0)
-
-                        if clan_stars > opp_stars:
-                            result_text = "🎉 <b>Ми перемогли!</b> 🏆"
-                        elif clan_stars < opp_stars:
-                            result_text = "💔 <b>На жаль, ми програли...</b> ⚔️"
-                        else:
-                            result_text = "🤝 <b>Нічия!</b> ⚔️"
-
-                        unattacked = []
-                        for member in c_war.get("clan", {}).get("members", []):
-                            p_tag = member.get("tag")
-                            p_name = member.get("name")
-                            attacks = member.get("attacks", [])
-                            att_cnt = len(attacks)
-                            record_player_stats(p_tag, p_name, "cwl", att_cnt, 1)
-                            if len(attacks) < 1:
-                                mention = format_mention(member["tag"], member["name"])
-                                unattacked.append(f"• {mention}")
-
-                        if unattacked:
-                            missed_str = "⚠️ <b>Атаку не зробили:</b>\n" + "\n".join(unattacked)
-                        else:
-                            missed_str = "🌟 <b>Усі учасники зробили свої атаки! Чудова робота!</b>"
-
-                        await send_to_topic(
-                            chat_id,
-                            f"🏁 <b>Раунд ЛВК проти «{opp_name}» завершено!</b>\n\n"
-                            f"{result_text}\n"
-                            f"⭐ Рахунок: <b>{clan_stars}</b> — <b>{opp_stars}</b>\n\n"
-                            f"{missed_str}"
-                        )
-                        bot_state[cwl_ended_key] = True
-                        save_json(STATE_FILE, bot_state)
-
-    # ================= 3. ПІДСУМОК УСІЄЇ ЛІГИ (CWL) =================
-    if cwl_group and cwl_group.get("state") == "ended":
-        cwl_season = cwl_group.get("season")
-        league_ended_key = f"cwl_season_summary_{cwl_season}"
-
-        if not bot_state.get(league_ended_key, False):
-            stats = {}
-
-            for r in cwl_group.get("rounds", []):
-                for w_tag in r.get("warTags", []):
-                    if w_tag == "#0":
-                        continue
-                    clean_wtag = urllib.parse.quote(w_tag)
-                    c_war = get_clash_data(f"clanwarleagues/wars/{clean_wtag}")
-                    
-                    if c_war and c_war.get("clan", {}).get("tag") == CLAN_TAG:
-                        for m in c_war.get("clan", {}).get("members", []):
-                            tag = m.get("tag")
-                            name = m.get("name")
-                            if tag not in stats:
-                                stats[tag] = {"name": name, "stars": 0, "destruction": 0, "attacks": 0}
-                            
-                            for att in m.get("attacks", []):
-                                stats[tag]["stars"] += att.get("stars", 0)
-                                stats[tag]["destruction"] += att.get("destructionPercentage", 0)
-                                stats[tag]["attacks"] += 1
-
-            sorted_stats = sorted(
-                stats.values(), 
-                key=lambda x: (x["stars"], x["destruction"]), 
-                reverse=True
-            )
-
-            lines = []
-            for idx, p in enumerate(sorted_stats, start=1):
-                avg_dest = round(p["destruction"] / p["attacks"]) if p["attacks"] > 0 else 0
-                lines.append(
-                    f"{idx}. <b>{p['name']}</b> — ⭐ <b>{p['stars']}</b> "
-                    f"({p['attacks']}/7 атак, avg {avg_dest}%)"
-                )
-
-            summary_text = (
-                f"🏆 <b>Підсумки Ліги Війн Кланів (Сезон {cwl_season})!</b> 🏁\n\n"
-                f"📊 <b>Топи за весь сезон:</b>\n\n" + "\n".join(lines) + "\n\n"
-                f"Дякуємо всім за активну участь у ЛВК! 💪🔥"
-            )
-
-            await send_to_topic(chat_id, summary_text)
-            bot_state[league_ended_key] = True
-            save_json(STATE_FILE, bot_state)
-
-async def check_raid_events(chat_id: int):
-    raids = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
-    if not raids or "items" not in raids or not raids["items"]:
-        return
-
-    current = raids["items"][0]
-    state = current.get("state")
-
-    if state == "ongoing" and bot_state.get("last_raid_state") != "ongoing":
-        await send_to_topic(
-            chat_id,
-            "Добрий ранок, любі друзі. ☺️ Почалися Рейди! 🏹🗡️\nАтакуйте, робіть 6 атак і не залишайте недобиті регіони іншим! 🐶"
-        )
-        bot_state["raid_24h_reminded"] = False
-
-    if state == "ongoing":
-        end_time = parse_coc_time(current["endTime"])
-        now = datetime.now(timezone.utc)
-        hours_left = (end_time - now).total_seconds() / 3600
-        
-        if 0 < hours_left <= 24.5 and not bot_state.get("raid_24h_reminded", False):
-            unfinished = []
-            for m in current.get("members", []):
-                cnt = m.get("attacks", 0)
-                if isinstance(cnt, dict):
-                    cnt = cnt.get("count", 0)
-                limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
-                if cnt < limit:
-                    unfinished.append(f"{format_mention(m['tag'], m['name'])} {cnt}/{limit} ⚔️")
-            
-            if unfinished:
-                names = ", ".join(unfinished)
-                await send_to_topic(
-                    chat_id,
-                    f"Шановні {names} зробіть, будь ласка, атаки в рейдах 😊🗡️"
-                )
-            bot_state["raid_24h_reminded"] = True
-
-    if state == "ended" and bot_state.get("last_raid_state") == "ongoing":
-        total_loot = current.get("capitalTotalLoot", 0)
-        raids_completed = current.get("raidsCompleted", 0)
-        raid_members = {m.get("tag"): m for m in current.get("members", [])}
-
-        clan_data = get_clash_data(f"clans/{ENCODED_TAG}")
-        all_clan_members = clan_data.get("memberList", []) if clan_data else []
-
-        unfinished = []
-        total_attacks = 0
-
-        for clan_m in all_clan_members:
-            tag = clan_m.get("tag", "")
-            name = clan_m.get("name", "Гравець")
-
-            if tag in raid_members:
-                m = raid_members[tag]
-                cnt = m.get("attacks", 0)
-                if isinstance(cnt, dict):
-                    cnt = cnt.get("count", 0)
-                limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
-            else:
-                cnt = 0
-                limit = 6
-
-            total_attacks += cnt
-            record_player_stats(tag, name, "raid", cnt, limit)
-
-            if cnt < limit:
-                unfinished.append(f"• {format_mention(tag, name)} — {cnt}/{limit} ⚔️")
-
-        text = "🏹 <b>Рейди закінчилися! Підбиваємо підсумки:</b>\n\n"
-        text += f"💰 <b>Всього добуто золота:</b> {total_loot:,}\n"
-        text += f"⚔️ <b>Всього зроблено атак:</b> {total_attacks}\n"
-        text += f"🏰 <b>Знищено ворожих районів:</b> {raids_completed}\n\n"
-
-        if unfinished:
-            text += f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
-        else:
-            text += "🎉 Усі учасники зробили максимум атак!"
-
-        await send_to_topic(chat_id, text)
-
-    bot_state["last_raid_state"] = state
-    save_json(STATE_FILE, bot_state)
-
-async def check_clan_games(chat_id: int):
-    now = datetime.now(timezone.utc)
-    if now.day == 22 and 8 <= now.hour <= 10 and not bot_state.get("clan_games_reminded", False):
-        await send_to_topic(
-            chat_id,
-            "Доброго ранку, шановні 💚 Почалися Ігри Кланів! ⚽\nНабийте, будь ласка, 4к очок, аби отримати додаткову нагороду 🎁\nВсім успіхів 💜"
-        )
-        bot_state["clan_games_reminded"] = True
-        save_json(STATE_FILE, bot_state)
-    elif now.day != 22:
-        bot_state["clan_games_reminded"] = False
-        save_json(STATE_FILE, bot_state)
-
-async def is_youtube_shorts(video_id: str) -> bool:
-    async with aiohttp.ClientSession() as session:
-        url = f"https://www.youtube.com/shorts/{video_id}"
-        async with session.head(url, allow_redirects=False) as resp:
-            return resp.status == 200
-
-async def check_youtube_news():
-    now = datetime.now()
-    
-    # Працюємо тільки з 8:00 до 20:00
-    if not (8 <= now.hour < 20):
-        return
-
-    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
-    try:
-        feed = feedparser.parse(rss_url)
-        if not feed.entries:
-            return
-
-        latest_video = feed.entries[0]
-        video_id = latest_video.yt_videoid
-        video_title = latest_video.title
-        video_link = latest_video.link
-        video_summary = latest_video.get("summary", "")
-
-        if bot_state.get("last_youtube_video_id") != video_id:
-            
-            if await is_youtube_shorts(video_id):
-                bot_state["last_youtube_video_id"] = video_id
-                save_json(STATE_FILE, bot_state)
-                return
-
-            army_match = re.search(r'https://link\.clashofclans\.com/[^\s"]+action=CopyArmy[^\s"]*', video_summary)
-            
-            builder = InlineKeyboardBuilder()
-            hint_text = ""
-            
-            if army_match:
-                army_link = army_match.group(0)
-                builder.button(text="⚔️ Скопіювати мікс у гру", url=army_link)
-                hint_text = "\n\n💡 <i>У описі знайдено мікс! Натискай кнопку нижче, щоб завантажити його в гру.</i>"
-            
-            builder.button(text="📺 Дивитися відео", url=video_link)
-            builder.adjust(1)
-
-            text = (
-                f"🎬 <b>Нове відео від SALOMON!</b>\n\n"
-                f"📌 <b>{video_title}</b>"
-                f"{hint_text}"
-            )
-
-            chat_id = CHAT_ID
-            if chat_id:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    message_thread_id=NEWS_THREAD_ID,
-                    parse_mode="HTML",
-                    reply_markup=builder.as_markup()
-                )
-                bot_state["last_youtube_video_id"] = video_id
-                save_json(STATE_FILE, bot_state)
-
-    except Exception as e:
-        logging.error(f"Помилка YouTube RSS: {e}")
-
-async def background_checker():
-    while True:
-        try:
-            target_id = CHAT_ID
-            if target_id and target_id != 0:
-                await check_war_events(target_id)
-                await check_raid_events(target_id)
-                await check_clan_games(target_id)
-                await check_youtube_news()
-                
-                now = datetime.now()
-                if now.weekday() == 0 and now.hour == 14 and now.minute < 5:
-                    report_text = await process_weekly_league_report()
-                    await bot.send_message(
-                        target_id,
-                        report_text,
-                        message_thread_id=THREAD_ID,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-        except Exception as e:
-            logging.error(f"Помилка фонової перевірки: {e}")
-        await asyncio.sleep(300)
-
-@dp.message(Command("stats"))
-async def cmd_stats(msg: types.Message):
-    await msg.answer("📊 Збираю дані про пропущені атаки за місяць, зачекайте...")
-
-    # 1. Склад клану
-    clan_data = get_clash_data(f"clans/{ENCODED_TAG}/members")
-    if not clan_data or "items" not in clan_data:
-        await msg.answer("⚠️ Не вдалося отримати список учасників клану.")
-        return
-
-    # Ініціалізуємо лічильники для кожного гравця
-    stats = {}
-    for m in clan_data["items"]:
-        stats[m["tag"]] = {
-            "name": m["name"],
-            "missed_cw": 0,
-            "missed_cwl": 0,
-            "missed_raid": 0
-        }
-
-    # 2. Перевірка звичайних КВ (War Log)
-    warlog = get_clash_data(f"clans/{ENCODED_TAG}/warlog")
-    if warlog and "items" in warlog:
-        # Беремо останні КВ за місяць (наприклад, до 10 останніх війн)
-        for entry in warlog.get("items", [])[:10]:
-            # Якщо є детальні дані про війну
-            if "clan" in entry and "members" in entry["clan"]:
-                for m in entry["clan"]["members"]:
-                    tag = m.get("tag")
-                    if tag in stats:
-                        attacks_done = len(m.get("attacks", []))
-                        # У звичайній КВ дається 2 атаки
-                        if attacks_done < 2:
-                            stats[tag]["missed_cw"] += (2 - attacks_done)
-
-    # 3. Перевірка ЛВК (CWL)
-    cwl_group = get_clash_data(f"clans/{ENCODED_TAG}/currentwar/leaguegroup")
-    if cwl_group and "rounds" in cwl_group:
-        for r in cwl_group.get("rounds", []):
-            for war_tag in r.get("warTags", []):
-                if war_tag == "#0":
-                    continue
-                war_data = get_clash_data(f"clanwarleagues/wars/{ENCODED_TAG_URL(war_tag)}")
-                if not war_data:
-                    continue
-                
-                # Визначаємо, де наш клан (clan чи opponent)
-                our_clan = None
-                if war_data.get("clan", {}).get("tag") == f"#{ENCODED_TAG}":
-                    our_clan = war_data["clan"]
-                elif war_data.get("opponent", {}).get("tag") == f"#{ENCODED_TAG}":
-                    our_clan = war_data["opponent"]
-
-                if our_clan and "members" in our_clan:
-                    for m in our_clan["members"]:
-                        tag = m.get("tag")
-                        if tag in stats:
-                            # В ЛВК дається 1 атака на день
-                            if len(m.get("attacks", [])) == 0:
-                                stats[tag]["missed_cwl"] += 1
-
-    # 4. Перевірка Рейд-вікендів (останні 4 тижні)
-    raid_data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
-    if raid_data and "items" in raid_data:
-        for raid in raid_data.get("items", [])[:4]:
-            for m in raid.get("members", []):
-                tag = m.get("tag")
-                if tag in stats:
-                    attacks_done = m.get("attacks", 0)
-                    limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
-                    if attacks_done < limit:
-                        stats[tag]["missed_raid"] += (limit - attacks_done)
-
-    # 5. Формування звіту
-    debtors = []
-    for tag, p in stats.items():
-        total_missed = p["missed_cw"] + p["missed_cwl"] + p["missed_raid"]
-        if total_missed > 0:
-            debtors.append((total_missed, p))
-
-    if not debtors:
-        await msg.answer("🎉 **Ідеально!** За останній місяць жоден гравець не пропустив жодної атаки.")
-        return
-
-    # Сортуємо: зверху ті, у кого найбільше пропусків
-    debtors.sort(key=lambda x: x[0], reverse=True)
-
-    lines = ["📊 **Статистика пропущених атак за місяць:**\n"]
-    for _, p in debtors:
-        details = []
-        if p["missed_cw"] > 0:
-            details.append(f"⚔️ КВ: **{p['missed_cw']}**")
-        if p["missed_cwl"] > 0:
-            details.append(f"🏆 ЛВК: **{p['missed_cwl']}**")
-        if p["missed_raid"] > 0:
-            details.append(f"🏰 Рейди: **{p['missed_raid']}**")
-
-        lines.append(f"• **{p['name']}**: " + ", ".join(details))
-
-    await msg.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(Command("raidstats"))
 async def cmd_raidstats(msg: types.Message):
-    data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
-    if not data or "items" not in data or not data["items"]:
+    data = await clash.get(f"clans/{ENCODED_TAG}/capitalraidseasons?limit=1")
+    if not data or not data.get("items"):
         await msg.answer("⚠️ Не вдалося отримати дані про рейди від Supercell.")
         return
 
-    last_raid = data["items"][0]
-    total_loot = last_raid.get("capitalTotalLoot", 0)
-    raids_completed = last_raid.get("raidsCompleted", 0)
-    raid_members = {m.get("tag"): m for m in last_raid.get("members", [])}
-
-    clan_data = get_clash_data(f"clans/{ENCODED_TAG}")
+    raid = data["items"][0]
+    raid_members = {m.get("tag"): m for m in raid.get("members", [])}
+    clan_data = await clash.get(f"clans/{ENCODED_TAG}")
     all_clan_members = clan_data.get("memberList", []) if clan_data else []
 
     unfinished = []
     total_attacks = 0
-
-    for clan_m in all_clan_members:
-        tag = clan_m.get("tag", "")
-        name = clan_m.get("name", "Гравець")
-        
+    for clan_member in all_clan_members:
+        tag = clan_member.get("tag", "")
+        name = clan_member.get("name", "Гравець")
         if tag in raid_members:
-            m = raid_members[tag]
-            used = m.get("attacks", 0)
+            member = raid_members[tag]
+            used = member.get("attacks", 0)
             if isinstance(used, dict):
                 used = used.get("count", 0)
-            limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
+            limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
         else:
             used = 0
             limit = 6
 
-        total_attacks += used
-
+        total_attacks += int(used or 0)
         if used < limit:
             unfinished.append(f"• {format_mention(tag, name)} — {used}/{limit} ⚔️")
 
-    text = f"🏹 <b>Підсумки останнього рейду:</b>\n\n"
-    text += f"💰 <b>Всього добуто золота:</b> {total_loot:,}\n"
-    text += f"⚔️ <b>Всього зроблено атак:</b> {total_attacks}\n"
-    text += f"🏰 <b>Знищено ворожих районів:</b> {raids_completed}\n\n"
+    text = (
+        "🏹 <b>Підсумки останнього рейду:</b>\n\n"
+        f"💰 <b>Всього добуто золота:</b> {raid.get('capitalTotalLoot', 0):,}\n"
+        f"⚔️ <b>Всього зроблено атак:</b> {total_attacks}\n"
+        f"🏰 <b>Знищено ворожих районів:</b> {raid.get('raidsCompleted', 0)}\n\n"
+    )
+    text += (
+        f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
+        if unfinished
+        else "🎉 Усі учасники зробили максимум атак!"
+    )
+    await msg.answer(text, parse_mode=ParseMode.HTML)
 
-    if unfinished:
-        text += f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
-    else:
-        text += "🎉 Усі учасники зробили максимум атак!"
 
-    await msg.answer(text, parse_mode="HTML")
+# ============================================================
+# WELCOME
+# ============================================================
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    asyncio.create_task(background_checker())
-    
-    await dp.start_polling(bot)
+
+@dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
+async def welcome_new_chat_member(event: ChatMemberUpdated):
+    user = event.new_chat_member.user
+    mention = f'<a href="tg://user?id={user.id}">{esc(user.first_name or "друже")}</a>'
+    text = (
+        f"Привіт, {mention}! 👋 Вітаємо у нашому чаті! 🏰\n\n"
+        "Будь ласка, прив'яжи свій Telegram до ігрового профілю в Clash of Clans.\n"
+        "Для цього напиши команду:\n"
+        "<code>/link #ТВІЙ_ТЕГ</code> (наприклад, <code>/link #2ABC123</code>)"
+    )
+    await send_to_topic(event.chat.id, text)
+
+
+# ============================================================
+# BACKGROUND NOTIFICATIONS
+# ============================================================
+
+
+async def check_war_events(chat_id: int) -> None:
+    war = await clash.get(f"clans/{ENCODED_TAG}/currentwar")
+    if not war or war.get("state") == "notInWar":
+        return
+
+    our_clan, opp_clan = our_and_opponent(war)
+    if not our_clan or not opp_clan:
+        return
+
+    state = war.get("state")
+    war_id = war.get("endTime") or war.get("startTime") or opp_clan.get("tag", "unknown")
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(war_id))
+    start_time = parse_coc_time(war.get("startTime"))
+    end_time = parse_coc_time(war.get("endTime"))
+    attack_limit = int(war.get("attacksPerMember", 2) or 2)
+
+    if state == "inWar":
+        start_key = f"war_started_{safe_id}"
+        if not state_once(start_key):
+            if recent_enough(start_time, 1.0):
+                await send_to_topic(
+                    chat_id,
+                    f"Почалася війна з <b>{esc(opp_clan.get('name', 'ворогом'))}</b> ⚔️\n"
+                    f"Не забувайте зробити {attack_limit} атаки. Всім успіхів! 💙",
+                    photo="24.jpg",
+                )
+            mark_state(start_key)
+
+        reminder_key = f"war_3h_{safe_id}"
+        if end_time and not state_once(reminder_key):
+            hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
+            if 0 < hours_left <= 3.5:
+                unattacked = []
+                for member in our_clan.get("members", []):
+                    count = len(member.get("attacks", []))
+                    if count < attack_limit:
+                        unattacked.append(
+                            f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} ({count}/{attack_limit})"
+                        )
+                if unattacked:
+                    await send_to_topic(
+                        chat_id,
+                        "⚠️ <b>Залишилося близько 3 годин до кінця КВ!</b> 🕛\n\n"
+                        "Гравці, які ще не зробили всі атаки:\n\n"
+                        + "\n".join(unattacked)
+                        + "\n\nЗробіть, будь ласка, свої атаки! ⚔️",
+                    )
+                mark_state(reminder_key)
+
+    if state == "warEnded":
+        ended_key = f"war_ended_{safe_id}"
+        recorded_key = f"war_recorded_{safe_id}"
+
+        if not state_once(recorded_key):
+            rows = []
+            for member in our_clan.get("members", []):
+                rows.append(
+                    (
+                        member.get("tag", ""),
+                        member.get("name", "Гравець"),
+                        len(member.get("attacks", [])),
+                        attack_limit,
+                    )
+                )
+            record_event_stats("cw", rows, end_time)
+            mark_state(recorded_key)
+
+        if not state_once(ended_key):
+            if recent_enough(end_time, 12.0):
+                not_full = []
+                for member in our_clan.get("members", []):
+                    attacks = member.get("attacks", [])
+                    count = len(attacks)
+                    stars = sum(int(a.get("stars", 0) or 0) for a in attacks)
+                    if count < attack_limit:
+                        not_full.append(
+                            f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} — "
+                            f"{count}/{attack_limit} атак ⚔️, {stars} ⭐"
+                        )
+
+                text = (
+                    f"🏁 Війна проти «<b>{esc(opp_clan.get('name', 'ворогом'))}</b>» закінчена.\n"
+                    f"{war_result_text(our_clan, opp_clan)}\n"
+                    f"⭐ Рахунок: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n\n"
+                )
+                text += (
+                    "⚠️ <b>Гравці, які не зробили всі атаки:</b>\n" + "\n".join(not_full)
+                    if not_full
+                    else "🎉 Усі зробили свої атаки! Молодці!"
+                )
+                await send_to_topic(chat_id, text, photo="25.jpg")
+            mark_state(ended_key)
+
+
+async def check_cwl_events(chat_id: int) -> None:
+    group = await clash.get(f"clans/{ENCODED_TAG}/currentwar/leaguegroup")
+    if not group or group.get("state") == "notInWar":
+        return
+
+    war_cache: dict[str, dict[str, Any]] = {}
+
+    for round_data in group.get("rounds", []):
+        for war_tag in round_data.get("warTags", []):
+            if war_tag == "#0":
+                continue
+
+            key_tag = war_tag.replace("#", "")
+            summary_done = state_once(f"cwl_ended_{key_tag}")
+            stats_done = state_once(f"cwl_recorded_{key_tag}")
+            if group.get("state") != "ended" and summary_done and stats_done:
+                continue
+
+            war = await clash.get(f"clanwarleagues/wars/{encode_tag(war_tag)}")
+            if not war:
+                continue
+            war_cache[war_tag] = war
+
+            our_clan, opp_clan = our_and_opponent(war)
+            if not our_clan or not opp_clan:
+                continue
+
+            state = war.get("state")
+            start_time = parse_coc_time(war.get("startTime"))
+            end_time = parse_coc_time(war.get("endTime"))
+
+            if state == "inWar":
+                start_key = f"cwl_started_{key_tag}"
+                if not state_once(start_key):
+                    if recent_enough(start_time, 1.0):
+                        await send_to_topic(
+                            chat_id,
+                            f"🏆 <b>Розпочався новий день ЛВК проти «{esc(opp_clan.get('name', 'суперника'))}»!</b> ⚔️\n\n"
+                            "Не забувайте зробити свою 1 вирішальну атаку! Успіхів та 3 зірок кожному! 🛡️✨",
+                        )
+                    mark_state(start_key)
+
+                reminder_key = f"cwl_3h_{key_tag}"
+                if end_time and not state_once(reminder_key):
+                    hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if 0 < hours_left <= 3.5:
+                        unattacked = []
+                        for member in our_clan.get("members", []):
+                            if not member.get("attacks", []):
+                                unattacked.append(
+                                    f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} (0/1)"
+                                )
+                        if unattacked:
+                            await send_to_topic(
+                                chat_id,
+                                "🏆 <b>Залишилося близько 3 годин до кінця раунду ЛВК!</b> 🕛\n\n"
+                                "Гравці, які ще не зробили атаку:\n\n"
+                                + "\n".join(unattacked)
+                                + "\n\nЗробіть, будь ласка, свій бій за клан! ⚔️",
+                            )
+                        mark_state(reminder_key)
+
+            if state == "warEnded":
+                recorded_key = f"cwl_recorded_{key_tag}"
+                ended_key = f"cwl_ended_{key_tag}"
+
+                if not state_once(recorded_key):
+                    rows = [
+                        (
+                            member.get("tag", ""),
+                            member.get("name", "Гравець"),
+                            len(member.get("attacks", [])),
+                            1,
+                        )
+                        for member in our_clan.get("members", [])
+                    ]
+                    record_event_stats("cwl", rows, end_time)
+                    mark_state(recorded_key)
+
+                if not state_once(ended_key):
+                    if recent_enough(end_time, 12.0):
+                        unattacked = [
+                            f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))}"
+                            for member in our_clan.get("members", [])
+                            if not member.get("attacks", [])
+                        ]
+                        missed = (
+                            "⚠️ <b>Атаку не зробили:</b>\n" + "\n".join(unattacked)
+                            if unattacked
+                            else "🌟 <b>Усі учасники зробили свої атаки! Чудова робота!</b>"
+                        )
+                        await send_to_topic(
+                            chat_id,
+                            f"🏁 <b>Раунд ЛВК проти «{esc(opp_clan.get('name', 'суперника'))}» завершено!</b>\n\n"
+                            f"{war_result_text(our_clan, opp_clan)}\n"
+                            f"⭐ Рахунок: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n\n"
+                            f"{missed}",
+                        )
+                    mark_state(ended_key)
+
+    if group.get("state") == "ended":
+        season = group.get("season", "невідомий")
+        season_key = f"cwl_season_summary_{season}"
+        if state_once(season_key):
+            return
+
+        stats: dict[str, dict[str, Any]] = {}
+        for round_data in group.get("rounds", []):
+            for war_tag in round_data.get("warTags", []):
+                if war_tag == "#0":
+                    continue
+                war = war_cache.get(war_tag)
+                if war is None:
+                    war = await clash.get(f"clanwarleagues/wars/{encode_tag(war_tag)}")
+                if not war:
+                    continue
+                our_clan, _ = our_and_opponent(war)
+                if not our_clan:
+                    continue
+
+                for member in our_clan.get("members", []):
+                    tag = member.get("tag", "")
+                    p = stats.setdefault(
+                        tag,
+                        {
+                            "name": member.get("name", "Гравець"),
+                            "stars": 0,
+                            "destruction": 0.0,
+                            "attacks": 0,
+                            "possible": 0,
+                        },
+                    )
+                    p["possible"] += 1
+                    for attack in member.get("attacks", []):
+                        p["stars"] += int(attack.get("stars", 0) or 0)
+                        p["destruction"] += float(attack.get("destructionPercentage", 0) or 0)
+                        p["attacks"] += 1
+
+        ranked = sorted(stats.values(), key=lambda p: (p["stars"], p["destruction"]), reverse=True)
+        lines = []
+        for idx, p in enumerate(ranked, 1):
+            avg = round(p["destruction"] / p["attacks"]) if p["attacks"] else 0
+            lines.append(
+                f"{idx}. <b>{esc(p['name'])}</b> — ⭐ <b>{p['stars']}</b> "
+                f"({p['attacks']}/{p['possible']} атак, avg {avg}%)"
+            )
+
+        text = (
+            f"🏆 <b>Підсумки Ліги Війн Кланів (сезон {esc(season)})!</b> 🏁\n\n"
+            "📊 <b>Топи за весь сезон:</b>\n\n"
+            + ("\n".join(lines) if lines else "Немає даних про атаки.")
+            + "\n\nДякуємо всім за активну участь у ЛВК! 💪🔥"
+        )
+        await send_to_topic(chat_id, text)
+        mark_state(season_key)
+
+
+async def check_raid_events(chat_id: int) -> None:
+    data = await clash.get(f"clans/{ENCODED_TAG}/capitalraidseasons?limit=1")
+    if not data or not data.get("items"):
+        return
+
+    raid = data["items"][0]
+    state = raid.get("state")
+    start_time = parse_coc_time(raid.get("startTime"))
+    end_time = parse_coc_time(raid.get("endTime"))
+    raid_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(raid.get("startTime") or raid.get("endTime") or "raid"))
+
+    if state == "ongoing":
+        start_key = f"raid_started_{raid_id}"
+        if not state_once(start_key):
+            if recent_enough(start_time, 2.0):
+                await send_to_topic(
+                    chat_id,
+                    "Добрий ранок, любі друзі. ☺️ Почалися Рейди! 🏹🗡️\n"
+                    "Атакуйте, робіть усі доступні атаки й не залишайте недобиті регіони іншим! 🐶",
+                )
+            mark_state(start_key)
+
+        reminder_key = f"raid_24h_{raid_id}"
+        if end_time and not state_once(reminder_key):
+            hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
+            if 0 < hours_left <= 24.5:
+                unfinished = []
+                for member in raid.get("members", []):
+                    count = member.get("attacks", 0)
+                    if isinstance(count, dict):
+                        count = count.get("count", 0)
+                    limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
+                    if count < limit:
+                        unfinished.append(
+                            f"{format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} {count}/{limit} ⚔️"
+                        )
+                if unfinished:
+                    await send_to_topic(
+                        chat_id,
+                        "Шановні " + ", ".join(unfinished) + ", зробіть, будь ласка, атаки в рейдах 😊🗡️",
+                    )
+                mark_state(reminder_key)
+
+    if state == "ended":
+        ended_key = f"raid_ended_{raid_id}"
+        recorded_key = f"raid_recorded_{raid_id}"
+
+        clan_data = await clash.get(f"clans/{ENCODED_TAG}")
+        all_clan_members = clan_data.get("memberList", []) if clan_data else []
+        raid_members = {member.get("tag"): member for member in raid.get("members", [])}
+
+        rows = []
+        unfinished = []
+        total_attacks = 0
+        for clan_member in all_clan_members:
+            tag = clan_member.get("tag", "")
+            name = clan_member.get("name", "Гравець")
+            if tag in raid_members:
+                member = raid_members[tag]
+                count = member.get("attacks", 0)
+                if isinstance(count, dict):
+                    count = count.get("count", 0)
+                limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
+            else:
+                count = 0
+                limit = 6
+
+            count = int(count or 0)
+            total_attacks += count
+            rows.append((tag, name, count, limit))
+            if count < limit:
+                unfinished.append(f"• {format_mention(tag, name)} — {count}/{limit} ⚔️")
+
+        if not state_once(recorded_key):
+            record_event_stats("raid", rows, end_time)
+            mark_state(recorded_key)
+
+        if not state_once(ended_key):
+            if recent_enough(end_time, 48.0):
+                text = (
+                    "🏹 <b>Рейди закінчилися! Підбиваємо підсумки:</b>\n\n"
+                    f"💰 <b>Всього добуто золота:</b> {raid.get('capitalTotalLoot', 0):,}\n"
+                    f"⚔️ <b>Всього зроблено атак:</b> {total_attacks}\n"
+                    f"🏰 <b>Знищено ворожих районів:</b> {raid.get('raidsCompleted', 0)}\n\n"
+                )
+                text += (
+                    f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
+                    if unfinished
+                    else "🎉 Усі учасники зробили максимум атак!"
+                )
+                await send_to_topic(chat_id, text)
+            mark_state(ended_key)
+
+
+async def check_clan_games(chat_id: int) -> None:
+    now = datetime.now(BOT_TIMEZONE)
+    key = f"clan_games_{now:%Y-%m}"
+    if now.day == 22 and 8 <= now.hour < 11 and not state_once(key):
+        await send_to_topic(
+            chat_id,
+            "Доброго ранку, шановні 💚 Почалися Ігри Кланів! ⚽\n"
+            "Набийте, будь ласка, 4к очок, аби отримати додаткову нагороду 🎁\n"
+            "Всім успіхів 💜",
+        )
+        mark_state(key)
+
+
+async def is_youtube_shorts(video_id: str) -> bool:
+    await clash.start()
+    assert clash.session is not None
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    try:
+        async with clash.session.head(url, allow_redirects=False) as response:
+            return response.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+
+
+async def check_youtube_news() -> None:
+    now = datetime.now(BOT_TIMEZONE)
+    if not (8 <= now.hour < 20) or not CHAT_ID:
+        return
+
+    await clash.start()
+    assert clash.session is not None
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+
+    try:
+        async with clash.session.get(rss_url) as response:
+            if response.status != 200:
+                logging.warning("YouTube RSS HTTP %s", response.status)
+                return
+            raw_feed = await response.read()
+
+        feed = feedparser.parse(raw_feed)
+        if not feed.entries:
+            return
+
+        latest = feed.entries[0]
+        video_id = getattr(latest, "yt_videoid", None)
+        if not video_id or bot_state.get("last_youtube_video_id") == video_id:
+            return
+
+        if await is_youtube_shorts(video_id):
+            mark_state("last_youtube_video_id", video_id)
+            return
+
+        title = esc(getattr(latest, "title", "Нове відео"))
+        video_link = getattr(latest, "link", f"https://www.youtube.com/watch?v={video_id}")
+        summary = latest.get("summary", "")
+        army_match = re.search(r'https://link\.clashofclans\.com/[^\s"<>]+action=CopyArmy[^\s"<>]*', summary)
+
+        builder = InlineKeyboardBuilder()
+        hint = ""
+        if army_match:
+            builder.button(text="⚔️ Скопіювати мікс у гру", url=army_match.group(0))
+            hint = "\n\n💡 <i>У описі знайдено мікс. Натискай кнопку нижче, щоб завантажити його в гру.</i>"
+        builder.button(text="📺 Дивитися відео", url=video_link)
+        builder.adjust(1)
+
+        text = f"🎬 <b>Нове відео від SALOMON!</b>\n\n📌 <b>{title}</b>{hint}"
+        kwargs = topic_kwargs(NEWS_THREAD_ID)
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=builder.as_markup(),
+            **kwargs,
+        )
+        mark_state("last_youtube_video_id", video_id)
+    except Exception as exc:
+        logging.error("Помилка YouTube RSS: %s", exc)
+
+
+async def maybe_send_weekly_report(chat_id: int) -> None:
+    now = datetime.now(BOT_TIMEZONE)
+    iso_year, iso_week, _ = now.isocalendar()
+    key = f"weekly_report_{iso_year}_{iso_week}"
+
+    # Any check during Monday 14:00-14:59 can deliver it, so a 5-minute loop
+    # cannot accidentally miss the tiny first-five-minutes window.
+    if now.weekday() == 0 and now.hour == 14 and not state_once(key):
+        report = await process_weekly_league_report()
+        await bot.send_message(
+            chat_id=chat_id,
+            text=report,
+            parse_mode=ParseMode.HTML,
+            **topic_kwargs(THREAD_ID),
+        )
+        if not report.startswith("❌"):
+            mark_state(key)
+
+
+async def background_checker() -> None:
+    while True:
+        try:
+            if CHAT_ID:
+                await check_war_events(CHAT_ID)
+                await check_cwl_events(CHAT_ID)
+                await check_raid_events(CHAT_ID)
+                await check_clan_games(CHAT_ID)
+                await check_youtube_news()
+                await maybe_send_weekly_report(CHAT_ID)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Помилка фонової перевірки")
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+
+async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+    logging.info("Запуск CoC Bot для клану %s", CLAN_TAG)
+    logging.info("Часовий пояс планувальника: %s", BOT_TIMEZONE_NAME)
+
+    await clash.start()
+    background_task = asyncio.create_task(background_checker(), name="background_checker")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            pass
+        await clash.close()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
