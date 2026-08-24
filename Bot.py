@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated, FSInputFile
 from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.enums import ParseMode
 
@@ -214,7 +214,7 @@ async def cmd_stats(message: types.Message):
             f" └ 🛡️ <b>Рейди:</b> зроблено {d['raid_done']} | ❌ пропущено {d['raid_missed']}\n"
         )
         
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("start", "help"))
 async def cmd_start(msg: types.Message):
@@ -229,9 +229,6 @@ async def cmd_start(msg: types.Message):
         ]
     ])
 
-    from aiogram.types import FSInputFile
-    import random
-    
     photo = FSInputFile("23.jpg")
     await msg.answer_photo(
         photo=photo,
@@ -269,7 +266,6 @@ async def process_callback_buttons(callback: types.CallbackQuery):
     
     await callback.answer()
 
-# Допоміжна функція перевірки на адміністратора
 async def is_admin(message: types.Message) -> bool:
     if message.chat.type == 'private':
         return True 
@@ -288,13 +284,12 @@ async def cmd_link(msg: types.Message):
     
     admin_mode = await is_admin(msg)
 
-    # Якщо адмін зробив реплай на повідомлення іншого користувача
     if admin_mode and msg.reply_to_message:
         target_user_id = msg.reply_to_message.from_user.id
         target_user_name = msg.reply_to_message.from_user.first_name
-        player_tag_arg_index = 1  # /link #TAG у реплаї
+        player_tag_arg_index = 1
     else:
-        player_tag_arg_index = 1  # звичайний виклик /link #TAG
+        player_tag_arg_index = 1
 
     if len(args) <= player_tag_arg_index:
         await msg.answer("Вкажіть ваш тег. Приклад: <code>/link #2ABC123</code>", parse_mode=ParseMode.HTML)
@@ -304,22 +299,19 @@ async def cmd_link(msg: types.Message):
     if not player_tag.startswith("#"):
         player_tag = "#" + player_tag
 
-    # Зберігаємо у твій словник згідно з твоєю структурою
     player_links[player_tag] = target_user_id
     save_json(PLAYERS_FILE, player_links)
 
     mention_html = f'<a href="tg://user?id={target_user_id}">{target_user_name}</a>'
     
-    from aiogram.types import FSInputFile
     try:
-        photo = FSInputFile("22.jpg")  # шлях до потрібної картинки
+        photo = FSInputFile("22.jpg")
         await msg.answer_photo(
             photo=photo,
             caption=f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨",
             parse_mode="HTML"
         )
     except Exception:
-        # Захист, якщо картинка 22.jpg раптом зникне з сервера
         await msg.answer(f"Чудово! Тег <code>{player_tag}</code> прив'язано до {mention_html} ✨", parse_mode="HTML")
 
 
@@ -333,13 +325,11 @@ async def cmd_unlink(msg: types.Message):
     if msg.reply_to_message:
         target_user_id = msg.reply_to_message.from_user.id
     else:
-        # Можна також спробувати знайти за тегом, якщо передали аргументом
         args = msg.text.split()
         if len(args) > 1:
             target_tag = args[1].upper().replace("%23", "#")
             if not target_tag.startswith("#"):
                 target_tag = "#" + target_tag
-            # Шукаємо і видаляємо за тегом
             found_tag = None
             for tag, uid in player_links.items():
                 if tag.upper() == target_tag:
@@ -355,7 +345,6 @@ async def cmd_unlink(msg: types.Message):
         await msg.answer("⚠️ Зробіть реплай (відповідь) на повідомлення користувача або вкажіть тег: <code>/unlink #TAG</code>", parse_mode="HTML")
         return
 
-    # Шукаємо тег за user_id у твоєму словнику
     found_tags = [tag for tag, uid in player_links.items() if uid == target_user_id]
     
     if not found_tags:
@@ -375,7 +364,6 @@ async def cmd_listlinks(msg: types.Message):
         await msg.answer("❌ Ця команда доступна лише адміністраторам.")
         return
 
-    # Завантажуємо дані прямо з JSON-файлу
     try:
         with open(PLAYERS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -386,7 +374,6 @@ async def cmd_listlinks(msg: types.Message):
         await msg.answer("📋 Список прив'язаних ігрових акаунтів порожній.")
         return
 
-    # Групуємо теги за user_id
     user_tags = {}
     for tag, uid in data.items():
         user_tags.setdefault(str(uid), []).append(tag)
@@ -396,7 +383,6 @@ async def cmd_listlinks(msg: types.Message):
     for uid_str, tags in user_tags.items():
         display_name = f"ID: {uid_str}"
 
-        # Пробуємо отримати інформацію про користувача з поточного чату
         clean_id = uid_str.lstrip('-')
         if clean_id.isdigit():
             try:
@@ -479,7 +465,6 @@ async def cmd_war(msg: types.Message):
             else:
                 res_str = "🤝 Бойова нічия!"
 
-        # Збираємо список тих, хто пропустив атаки
         clan_members = data.get("clan", {}).get("members", [])
         not_full = []
         for m in clan_members:
@@ -686,10 +671,8 @@ async def cmd_player_stats(msg: types.Message):
         f"⚔️ Зірки на війні: {war_stars}\n\n"
         f"🤲 Донат: {donations} / Отримано: {donations_rec}"
     )
-
-    from aiogram.types import FSInputFile
     
-    random_images = ["1.jpg", "2.jpg", "3.jpg","4.jpg","5.jpg","6.jpg","7.jpg","8.jpg","9.jpg","10.jpg","11.jpg","12.jpg",]
+    random_images = ["1.jpg", "2.jpg", "3.jpg","4.jpg","5.jpg","6.jpg","7.jpg","8.jpg","9.jpg","10.jpg","11.jpg","12.jpg"]
     chosen_image = random.choice(random_images)
     
     photo = FSInputFile(chosen_image)
@@ -699,7 +682,7 @@ async def cmd_player_stats(msg: types.Message):
         parse_mode="HTML"
     )
 
-# === ВІТАЛЬНИЙ ОБРОБНИК (УЧАСНИКИ ТЕЛЕГРАМ) ===
+# === ВІТАЛЬНИЙ ОБРОБНИК ===
 
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
 async def welcome_new_chat_member(event: ChatMemberUpdated):
@@ -719,8 +702,27 @@ async def welcome_new_chat_member(event: ChatMemberUpdated):
 
 # === АВТО-СПОВІЩЕННЯ У ГІЛКУ ===
 
-async def send_to_topic(chat_id: int, text: str):
-    await bot.send_message(chat_id=chat_id, message_thread_id=THREAD_ID, text=text, parse_mode=ParseMode.HTML)
+async def send_to_topic(chat_id: int, text: str, photo: str | None = None):
+    if photo:
+        try:
+            photo_file = FSInputFile(photo)
+            await bot.send_photo(
+                chat_id=chat_id,
+                message_thread_id=THREAD_ID,
+                photo=photo_file,
+                caption=text,
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception as e:
+            logging.error(f"Не вдалося надіслати фото {photo}: {e}")
+
+    await bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=THREAD_ID,
+        text=text,
+        parse_mode=ParseMode.HTML
+    )
 
 async def check_war_events(chat_id: int):
     # ================= 1. ЗВИЧАЙНЕ КВ =================
@@ -728,16 +730,18 @@ async def check_war_events(chat_id: int):
     if war and "state" in war:
         state = war["state"]
 
+        # Початок війни
         if state == "inWar" and bot_state.get("last_war_state") == "preparation":
             opponent = war.get("opponent", {}).get("name", "ворога")
             await send_to_topic(
                 chat_id,
                 f"Почалася війна з <b>{opponent}</b> ⚔️\nНе забувайте зробити 2 атаки. Всім успіхів в атаках 💖\nІ нехай удача завжди буде з вами 🙋‍♂️ 💙",
-                photo="24.jpg")
-            
+                photo="24.jpg"
+            )
             bot_state["war_3h_reminded"] = False
             save_json(STATE_FILE, bot_state)
 
+        # Нагадування за 3 години
         if state == "inWar":
             end_time = parse_coc_time(war["endTime"])
             now = datetime.now(timezone.utc)
@@ -764,6 +768,51 @@ async def check_war_events(chat_id: int):
                 bot_state["war_3h_reminded"] = True
                 save_json(STATE_FILE, bot_state)
 
+        # Закінчення звичайного КВ
+        if state == "warEnded" and bot_state.get("last_war_state") == "inWar":
+            opponent_name = war.get("opponent", {}).get("name", "ворогом")
+            my_stars = war.get("clan", {}).get("stars", 0)
+            op_stars = war.get("opponent", {}).get("stars", 0)
+            
+            my_dest = war.get("clan", {}).get("destructionPercentage", 0)
+            op_dest = war.get("opponent", {}).get("destructionPercentage", 0)
+
+            if my_stars > op_stars:
+                res_text = "перемогли 💪🏆"
+            elif my_stars < op_stars:
+                res_text = "програли 💔"
+            else:
+                if my_dest > op_dest:
+                    res_text = f"перемогли за відсотками ({my_dest:.1f}% проти {op_dest:.1f}%) 💪🏆"
+                elif my_dest < op_dest:
+                    res_text = f"програли за відсотками ({my_dest:.1f}% проти {op_dest:.1f}%) 💔"
+                else:
+                    res_text = "зіграли в НІЧИЮ 🤝⚖️"
+            
+            clan_members = war.get("clan", {}).get("members", [])
+            not_full = []
+            for m in clan_members:
+                attacks = m.get("attacks", [])
+                cnt = len(attacks)
+                stars = sum(a.get("stars", 0) for a in attacks)
+                record_player_stats(m.get("tag"), m.get("name"), "cw", cnt, 2)
+                if cnt < 2:
+                    mention = format_mention(m["tag"], m["name"])
+                    not_full.append(f"• {mention} - {cnt}/2 атак ⚔️, {stars} ⭐")
+            
+            msg_text = (
+                f"🏁 Війна проти «<b>{opponent_name}</b>» закінчена.\n"
+                f"Ми {res_text}!\n"
+                f"⭐ Рахунок: <b>{my_stars}</b> — <b>{op_stars}</b>\n\n"
+            )
+            if not_full:
+                msg_text += "⚠️ <b>Гравці, які не зробили всі атаки:</b>\n" + "\n".join(not_full)
+            else:
+                msg_text += "🎉 Усі зробили свої атаки! Молодці!"
+                
+            await send_to_topic(chat_id, msg_text, photo="25.jpg")
+
+        # Зберігаємо стан звичайного КВ
         bot_state["last_war_state"] = state
         save_json(STATE_FILE, bot_state)
 
@@ -786,13 +835,11 @@ async def check_war_events(chat_id: int):
                 state = c_war.get("state")
                 round_id = c_war.get("endTime")
 
-                # --- 1. АНОНС СТАРТУ ТА НАГАДУВАННЯ (під час війни) ---
                 if state == "inWar":
                     end_time = parse_coc_time(c_war.get("endTime"))
                     now = datetime.now(timezone.utc)
                     hours_left = (end_time - now).total_seconds() / 3600
 
-                    # Повідомлення про початок
                     cwl_start_key = f"cwl_announced_{round_id}"
                     if not bot_state.get(cwl_start_key, False):
                         opp_name = c_war.get("opponent", {}).get("name", "суперника")
@@ -804,7 +851,6 @@ async def check_war_events(chat_id: int):
                         bot_state[cwl_start_key] = True
                         save_json(STATE_FILE, bot_state)
 
-                    # Нагадування за 3 години
                     if 0 < hours_left <= 3.5:
                         if bot_state.get("last_cwl_round") != round_id:
                             clan_data = c_war.get("clan", {})
@@ -826,7 +872,6 @@ async def check_war_events(chat_id: int):
                             bot_state["last_cwl_round"] = round_id
                             save_json(STATE_FILE, bot_state)
 
-                # --- 2. ПІДСУМОК ПІСЛЯ ЗАКІНЧЕННЯ РАУНДУ ЛВК ---
                 elif state == "warEnded":
                     cwl_ended_key = f"cwl_ended_{round_id}"
                     if not bot_state.get(cwl_ended_key, False):
@@ -866,58 +911,6 @@ async def check_war_events(chat_id: int):
                         )
                         bot_state[cwl_ended_key] = True
                         save_json(STATE_FILE, bot_state)
-
-    if state == "warEnded" and bot_state.get("last_war_state") == "inWar":
-        opponent_name = war.get("opponent", {}).get("name", "ворогом")
-        my_stars = war.get("clan", {}).get("stars", 0)
-        op_stars = war.get("opponent", {}).get("stars", 0)
-        
-        # Перевірка на перемогу, нічию або поразку (з урахуванням відсотків руйнування)
-        my_dest = war.get("clan", {}).get("destructionPercentage", 0)
-        op_dest = war.get("opponent", {}).get("destructionPercentage", 0)
-
-        if my_stars > op_stars:
-            res_text = "перемогли 💪🏆"
-        elif my_stars < op_stars:
-            res_text = "програли 💔"
-        else:
-            # Зірки рівні, перевіряємо відсотки
-            if my_dest > op_dest:
-                res_text = f"перемогли за відсотками ({my_dest:.1f}% проти {op_dest:.1f}%) 💪🏆"
-            elif my_dest < op_dest:
-                res_text = f"програли за відсотками ({my_dest:.1f}% проти {op_dest:.1f}%) 💔"
-            else:
-                res_text = "зіграли в НІЧИЮ 🤝⚖️"
-        
-        clan_members = war.get("clan", {}).get("members", [])
-        not_full = []
-        for m in clan_members:
-            attacks = m.get("attacks", [])
-            cnt = len(attacks)
-            stars = sum(a.get("stars", 0) for a in attacks)
-            record_player_stats(m.get("tag"), m.get("name"), "cw", cnt, 2)
-            if cnt < 2:
-                mention = format_mention(m["tag"], m["name"])
-                not_full.append(f"• {mention} - {cnt}/2 атак ⚔️, {stars} ⭐")
-        
-        msg_text = (
-            f"🏁 Війна проти «<b>{opponent_name}</b>» закінчена.\n"
-            f"Ми {res_text}!\n"
-            f"⭐ Рахунок: <b>{my_stars}</b> — <b>{op_stars}</b>\n\n"
-        )
-        if not_full:
-            msg_text += "⚠️ <b>Гравці, які не зробили всі атаки:</b>\n" + "\n".join(not_full)
-        else:
-            msg_text += "🎉 Усі зробили свої атаки! Молодці!"
-            
-        await send_to_topic(
-            chat_id, 
-            msg_text, 
-            photo="25.jpg"  # <-- Твоє фото для кінця КВ
-        )
-
-    bot_state["last_war_state"] = state
-    save_json(STATE_FILE, bot_state)
 
     # ================= 3. ПІДСУМОК УСІЄЇ ЛІГИ (CWL) =================
     if cwl_group and cwl_group.get("state") == "ended":
@@ -1068,7 +1061,6 @@ async def check_clan_games(chat_id: int):
         save_json(STATE_FILE, bot_state)
 
 async def is_youtube_shorts(video_id: str) -> bool:
-    """Перевіряє, чи є відео роликом Shorts."""
     async with aiohttp.ClientSession() as session:
         url = f"https://www.youtube.com/shorts/{video_id}"
         async with session.head(url, allow_redirects=False) as resp:
@@ -1077,7 +1069,7 @@ async def is_youtube_shorts(video_id: str) -> bool:
 async def check_youtube_news():
     now = datetime.now()
     
-    # Працюємо тільки з 8:00 ранку до 20:00 вечора
+    # Працюємо тільки з 8:00 до 20:00
     if not (8 <= now.hour < 20):
         return
 
@@ -1093,16 +1085,13 @@ async def check_youtube_news():
         video_link = latest_video.link
         video_summary = latest_video.get("summary", "")
 
-        # Перевіряємо, чи ми ще не постили це відео
         if bot_state.get("last_youtube_video_id") != video_id:
             
-            # Пропускаємо Shorts
             if await is_youtube_shorts(video_id):
                 bot_state["last_youtube_video_id"] = video_id
                 save_json(STATE_FILE, bot_state)
                 return
 
-            # Шукаємо ТІЛЬКИ посилання на армію (action=CopyArmy)
             army_match = re.search(r'https://link\.clashofclans\.com/[^\s"]+action=CopyArmy[^\s"]*', video_summary)
             
             builder = InlineKeyboardBuilder()
@@ -1172,7 +1161,6 @@ async def cmd_raidstats(msg: types.Message):
     raids_completed = last_raid.get("raidsCompleted", 0)
     raid_members = {m.get("tag"): m for m in last_raid.get("members", [])}
 
-    # Отримуємо повний склад клану, щоб знайти тих, хто має 0 атак
     clan_data = get_clash_data(f"clans/{ENCODED_TAG}")
     all_clan_members = clan_data.get("memberList", []) if clan_data else []
 
@@ -1191,7 +1179,7 @@ async def cmd_raidstats(msg: types.Message):
             limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
         else:
             used = 0
-            limit = 6  # Стандартний ліміт атак
+            limit = 6
 
         total_attacks += used
 
