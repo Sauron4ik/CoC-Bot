@@ -1005,23 +1005,33 @@ async def check_raid_events(chat_id: int):
     if state == "ended" and bot_state.get("last_raid_state") == "ongoing":
         total_loot = current.get("capitalTotalLoot", 0)
         raids_completed = current.get("raidsCompleted", 0)
-        
+        raid_members = {m.get("tag"): m for m in current.get("members", [])}
+
+        clan_data = get_clash_data(f"clans/{ENCODED_TAG}")
+        all_clan_members = clan_data.get("memberList", []) if clan_data else []
+
         unfinished = []
         total_attacks = 0
 
-        for m in current.get("members", []):
-            cnt = m.get("attacks", 0)
-            if isinstance(cnt, dict):
-                cnt = cnt.get("count", 0)
-                
-            limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
+        for clan_m in all_clan_members:
+            tag = clan_m.get("tag", "")
+            name = clan_m.get("name", "Гравець")
+
+            if tag in raid_members:
+                m = raid_members[tag]
+                cnt = m.get("attacks", 0)
+                if isinstance(cnt, dict):
+                    cnt = cnt.get("count", 0)
+                limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
+            else:
+                cnt = 0
+                limit = 6
+
             total_attacks += cnt
-            
-            # Запис статистики гравця
-            record_player_stats(m.get("tag"), m.get("name"), "raid", cnt, limit)
-            
+            record_player_stats(tag, name, "raid", cnt, limit)
+
             if cnt < limit:
-                unfinished.append(f"• {format_mention(m['tag'], m['name'])} — {cnt}/{limit} ⚔️")
+                unfinished.append(f"• {format_mention(tag, name)} — {cnt}/{limit} ⚔️")
 
         text = "🏹 <b>Рейди закінчилися! Підбиваємо підсумки:</b>\n\n"
         text += f"💰 <b>Всього добуто золота:</b> {total_loot:,}\n"
@@ -1031,7 +1041,7 @@ async def check_raid_events(chat_id: int):
         if unfinished:
             text += f"⚠️ <b>Гравці, які не зробили всі атаки ({len(unfinished)}):</b>\n" + "\n".join(unfinished)
         else:
-            text += "🎉 Усі учасники зробили максимум атак! Чудова робота!"
+            text += "🎉 Усі учасники зробили максимум атак!"
 
         await send_to_topic(chat_id, text)
 
@@ -1072,7 +1082,7 @@ async def background_checker():
         except Exception as e:
             logging.error(f"Помилка фонової перевірки: {e}")
         await asyncio.sleep(3600)
-        
+
 @dp.message(Command("raidstats"))
 async def cmd_raidstats(msg: types.Message):
     data = get_clash_data(f"clans/{ENCODED_TAG}/capitalraidseasons")
@@ -1081,23 +1091,31 @@ async def cmd_raidstats(msg: types.Message):
         return
 
     last_raid = data["items"][0]
-
     total_loot = last_raid.get("capitalTotalLoot", 0)
     raids_completed = last_raid.get("raidsCompleted", 0)
-    members = last_raid.get("members", [])
+    raid_members = {m.get("tag"): m for m in last_raid.get("members", [])}
+
+    # Отримуємо повний склад клану, щоб знайти тих, хто має 0 атак
+    clan_data = get_clash_data(f"clans/{ENCODED_TAG}")
+    all_clan_members = clan_data.get("memberList", []) if clan_data else []
 
     unfinished = []
     total_attacks = 0
 
-    for m in members:
-        tag = m.get("tag", "")
-        name = m.get("name", "Гравець")
-        used = m.get("attacks", 0)
+    for clan_m in all_clan_members:
+        tag = clan_m.get("tag", "")
+        name = clan_m.get("name", "Гравець")
+        
+        if tag in raid_members:
+            m = raid_members[tag]
+            used = m.get("attacks", 0)
+            if isinstance(used, dict):
+                used = used.get("count", 0)
+            limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
+        else:
+            used = 0
+            limit = 6  # Стандартний ліміт атак
 
-        if isinstance(used, dict):
-            used = used.get("count", 0)
-
-        limit = m.get("attackLimit", 5) + m.get("bonusAttackLimit", 0)
         total_attacks += used
 
         if used < limit:
