@@ -18,6 +18,7 @@ from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.filters import ChatMemberUpdatedFilter, Command, JOIN_TRANSITION
 from aiogram.types import (
     ChatMemberUpdated,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -947,7 +948,26 @@ async def cmd_raidstats(msg: types.Message):
     )
     await msg.answer(text, parse_mode=ParseMode.HTML)
 
+# ============================================================
+# GLOBAL ERROR HANDLER
+# ============================================================
 
+
+@dp.error()
+async def global_error_handler(event: ErrorEvent) -> None:
+    """Catch any unhandled exception from handlers so users get a reply instead of silence."""
+    logging.exception("Необроблена помилка в хендлері: %s", event.exception)
+
+    update = event.update
+    message = update.message or (update.callback_query.message if update.callback_query else None)
+
+    if message:
+        try:
+            await message.answer(
+                "⚠️ Сталася помилка під час обробки команди. Спробуйте, будь ласка, ще раз трохи пізніше."
+            )
+        except Exception:
+            pass
 # ============================================================
 # WELCOME
 # ============================================================
