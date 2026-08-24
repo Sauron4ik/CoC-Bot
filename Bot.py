@@ -5,6 +5,10 @@ import os
 import urllib.parse
 import requests
 import random
+import re
+import feedparser
+import aiohttp
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -21,6 +25,8 @@ COC_TOKEN = os.getenv("COC_TOKEN")
 CLAN_TAG = os.getenv("CLAN_TAG", "#2PGVU889Q")
 THREAD_ID = int(os.getenv("THREAD_ID", "14128"))
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+NEWS_THREAD_ID = 4026
+YOUTUBE_CHANNEL_ID = "UCekeHLY2xpfjcGq_3gHFaTA"  # Канал SALOMON
 
 if not TG_TOKEN or not COC_TOKEN:
     raise ValueError("⚠️ Помилка: TG_TOKEN або COC_TOKEN не знайдено у файлі .env!")
@@ -1061,6 +1067,76 @@ async def check_clan_games(chat_id: int):
         bot_state["clan_games_reminded"] = False
         save_json(STATE_FILE, bot_state)
 
+async def is_youtube_shorts(video_id: str) -> bool:
+    """Перевіряє, чи є відео роликом Shorts."""
+    async with aiohttp.ClientSession() as session:
+        url = f"https://www.youtube.com/shorts/{video_id}"
+        async with session.head(url, allow_redirects=False) as resp:
+            return resp.status == 200
+
+async def check_youtube_news():
+    now = datetime.now()
+    
+    # Працюємо тільки з 8:00 ранку до 20:00 вечора
+    if not (8 <= now.hour < 20):
+        return
+
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+    try:
+        feed = feedparser.parse(rss_url)
+        if not feed.entries:
+            return
+
+        latest_video = feed.entries[0]
+        video_id = latest_video.yt_videoid
+        video_title = latest_video.title
+        video_link = latest_video.link
+        video_summary = latest_video.get("summary", "")
+
+        # Перевіряємо, чи ми ще не постили це відео
+        if bot_state.get("last_youtube_video_id") != video_id:
+            
+            # Пропускаємо Shorts
+            if await is_youtube_shorts(video_id):
+                bot_state["last_youtube_video_id"] = video_id
+                save_json(STATE_FILE, bot_state)
+                return
+
+            # Шукаємо ТІЛЬКИ посилання на армію (action=CopyArmy)
+            army_match = re.search(r'https://link\.clashofclans\.com/[^\s"]+action=CopyArmy[^\s"]*', video_summary)
+            
+            builder = InlineKeyboardBuilder()
+            hint_text = ""
+            
+            if army_match:
+                army_link = army_match.group(0)
+                builder.button(text="⚔️ Скопіювати мікс у гру", url=army_link)
+                hint_text = "\n\n💡 <i>У описі знайдено мікс! Натискай кнопку нижче, щоб завантажити його в гру.</i>"
+            
+            builder.button(text="📺 Дивитися відео", url=video_link)
+            builder.adjust(1)
+
+            text = (
+                f"🎬 <b>Нове відео від SALOMON!</b>\n\n"
+                f"📌 <b>{video_title}</b>"
+                f"{hint_text}"
+            )
+
+            chat_id = getattr(bot, 'target_chat_id', CHAT_ID)
+            if chat_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    message_thread_id=NEWS_THREAD_ID,
+                    parse_mode="HTML",
+                    reply_markup=builder.as_markup()
+                )
+                bot_state["last_youtube_video_id"] = video_id
+                save_json(STATE_FILE, bot_state)
+
+    except Exception as e:
+        logging.error(f"Помилка YouTube RSS: {e}")
+
 async def background_checker():
     while True:
         try:
@@ -1069,7 +1145,8 @@ async def background_checker():
                 await check_war_events(target_id)
                 await check_raid_events(target_id)
                 await check_clan_games(target_id)
-
+                await check_youtube_news()
+                
                 now = datetime.now()
                 if now.weekday() == 0 and now.hour == 10:
                     report_text = await process_weekly_league_report()
