@@ -113,16 +113,20 @@ def mark_state(key: str, value: Any = True) -> None:
 
 def record_event_stats(
     event_type: str,
-    rows: list[tuple[str, str, int, int]],
+    rows: list[tuple[str, str, int, int, int]],
     event_time: Optional[datetime] = None,
 ) -> None:
-    """Record one completed event in history.json with a single disk write."""
+    """Record one completed event in history.json with a single disk write.
+
+    Each row is (player_tag, player_name, attacks_done, attacks_max, extra), where
+    `extra` means stars earned for "cw"/"cwl" events, or capital gold looted for "raid".
+    """
     history = load_json(HISTORY_FILE, {})
     dt = event_time or datetime.now(timezone.utc)
     month_key = dt.astimezone(BOT_TIMEZONE).strftime("%Y-%m")
     month = history.setdefault(month_key, {})
 
-    for player_tag, player_name, attacks_done, attacks_max in rows:
+    for player_tag, player_name, attacks_done, attacks_max, extra in rows:
         if not player_tag:
             continue
 
@@ -132,24 +136,31 @@ def record_event_stats(
                 "name": player_name or "Гравець",
                 "cw_done": 0,
                 "cw_missed": 0,
+                "cw_stars": 0,
                 "cwl_done": 0,
                 "cwl_missed": 0,
+                "cwl_stars": 0,
                 "raid_done": 0,
                 "raid_missed": 0,
+                "raid_gold": 0,
             },
         )
         p["name"] = player_name or p.get("name", "Гравець")
         missed = max(0, attacks_max - attacks_done)
+        extra = int(extra or 0)
 
         if event_type == "cw":
             p["cw_done"] = p.get("cw_done", 0) + attacks_done
             p["cw_missed"] = p.get("cw_missed", 0) + missed
+            p["cw_stars"] = p.get("cw_stars", 0) + extra
         elif event_type == "cwl":
             p["cwl_done"] = p.get("cwl_done", 0) + attacks_done
             p["cwl_missed"] = p.get("cwl_missed", 0) + missed
+            p["cwl_stars"] = p.get("cwl_stars", 0) + extra
         elif event_type == "raid":
             p["raid_done"] = p.get("raid_done", 0) + attacks_done
             p["raid_missed"] = p.get("raid_missed", 0) + missed
+            p["raid_gold"] = p.get("raid_gold", 0) + extra
 
     save_json(HISTORY_FILE, history)
 
@@ -281,6 +292,31 @@ def format_mention(tag: str, name: str) -> str:
     return safe_name
 
 
+def rank_with_ties(items: list, value_func, top_n: int = 5) -> list[tuple[int, Any]]:
+    """Sort items by value_func descending and return (rank, item) pairs.
+ 
+    Standard competition ranking: equal values share the same rank number, and if the
+    top_n-th place is tied among several items, ALL of them are included (not just the
+    first one encountered) so nobody with an equal score is arbitrarily dropped.
+    Items with a non-positive value are excluded entirely.
+    """
+    ranked_items = sorted(items, key=value_func, reverse=True)
+    result: list[tuple[int, Any]] = []
+    rank = 0
+    prev_value: Any = None
+    for item in ranked_items:
+        value = value_func(item)
+        if value <= 0:
+            break
+        if value != prev_value:
+            rank += 1
+            if rank > top_n:
+                break
+            prev_value = value
+        result.append((rank, item))
+    return result
+ 
+ 
 def topic_kwargs(thread_id: int) -> dict[str, int]:
     return {"message_thread_id": thread_id} if thread_id else {}
 
@@ -431,6 +467,58 @@ async def cmd_stats(message: types.Message):
             ]
         )
     await answer_html_lines(message, lines)
+ 
+ 
+@dp.message(Command("top"))
+async def cmd_top(message: types.Message):
+    month_key = datetime.now(BOT_TIMEZONE).strftime("%Y-%m")
+    history = load_json(HISTORY_FILE, {})
+    month = history.get(month_key, {})
+ 
+    lines = [f"🏆 <b>Рейтинг активності за {month_key}:</b>", ""]
+ 
+    # --- Донат (поточний ігровий сезон, з живих даних клану) ---
+    clan_data = await clash.get(f"clans/{ENCODED_TAG}")
+    members = clan_data.get("memberList", []) if clan_data else []
+    donor_ranking = rank_with_ties(members, lambda m: int(m.get("donations", 0) or 0))
+ 
+    lines.append("🎁 <b>Топ-5 донатерів:</b>")
+    if donor_ranking:
+        for rank, m in donor_ranking:
+            lines.append(
+                f"{rank}. {format_mention(m.get('tag', ''), m.get('name', 'Гравець'))} — "
+                f"{int(m.get('donations', 0) or 0):,}"
+            )
+    else:
+        lines.append("Поки що немає донатів у цьому сезоні.")
+    lines.append("")
+ 
+    # --- Зірки КВ + ЛВК за місяць (з накопиченої історії) ---
+    star_ranking = rank_with_ties(
+        list(month.items()),
+        lambda item: item[1].get("cw_stars", 0) + item[1].get("cwl_stars", 0),
+    )
+ 
+    lines.append("⭐ <b>Топ-5 за зірками КВ/ЛВК:</b>")
+    if star_ranking:
+        for rank, (tag, d) in star_ranking:
+            stars = d.get("cw_stars", 0) + d.get("cwl_stars", 0)
+            lines.append(f"{rank}. {format_mention(tag, d.get('name', 'Гравець'))} — {stars} ⭐")
+    else:
+        lines.append("Поки що немає завершених КВ/ЛВК у цьому місяці.")
+    lines.append("")
+ 
+    # --- Золото рейдів за місяць (з накопиченої історії) ---
+    gold_ranking = rank_with_ties(list(month.items()), lambda item: item[1].get("raid_gold", 0))
+ 
+    lines.append("💰 <b>Топ-5 за золотом рейдів:</b>")
+    if gold_ranking:
+        for rank, (tag, d) in gold_ranking:
+            lines.append(f"{rank}. {format_mention(tag, d.get('name', 'Гравець'))} — {d.get('raid_gold', 0):,}")
+    else:
+        lines.append("Поки що немає завершених рейдів у цьому місяці.")
+ 
+    await answer_html_lines(message, lines)
 
 
 @dp.message(Command("missedstats"))
@@ -496,6 +584,7 @@ async def cmd_start(msg: types.Message):
         "• /raidstats — підсумки останнього рейду\n"
         "• /cwl — стан ЛВК\n"
         "• /stats — накопичена статистика за місяць\n"
+        "• /top — топ-5 донатерів, зірок КВ/ЛВК і золота рейдів за місяць\n"
         "• /missedstats — рейтинг пропущених атак\n"
         "• /weekly_report — звіт по кубках та лігах\n\n"
         "Обирай кнопками нижче або вводь команди вручну!"
@@ -948,6 +1037,7 @@ async def cmd_raidstats(msg: types.Message):
     )
     await msg.answer(text, parse_mode=ParseMode.HTML)
 
+
 # ============================================================
 # GLOBAL ERROR HANDLER
 # ============================================================
@@ -968,6 +1058,8 @@ async def global_error_handler(event: ErrorEvent) -> None:
             )
         except Exception:
             pass
+
+
 # ============================================================
 # WELCOME
 # ============================================================
@@ -1047,12 +1139,15 @@ async def check_war_events(chat_id: int) -> None:
         if not state_once(recorded_key):
             rows = []
             for member in our_clan.get("members", []):
+                attacks = member.get("attacks", [])
+                stars = sum(int(a.get("stars", 0) or 0) for a in attacks)
                 rows.append(
                     (
                         member.get("tag", ""),
                         member.get("name", "Гравець"),
-                        len(member.get("attacks", [])),
+                        len(attacks),
                         attack_limit,
+                        stars,
                     )
                 )
             record_event_stats("cw", rows, end_time)
@@ -1074,7 +1169,9 @@ async def check_war_events(chat_id: int) -> None:
                 text = (
                     f"🏁 Війна проти «<b>{esc(opp_clan.get('name', 'ворогом'))}</b>» закінчена.\n"
                     f"{war_result_text(our_clan, opp_clan)}\n"
-                    f"⭐ Рахунок: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n\n"
+                    f"⭐ Рахунок: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n"
+                    f"💥 Руйнування: <b>{float(our_clan.get('destructionPercentage', 0) or 0):.2f}%</b> — "
+                    f"<b>{float(opp_clan.get('destructionPercentage', 0) or 0):.2f}%</b>\n\n"
                 )
                 text += (
                     "⚠️ <b>Гравці, які не зробили всі атаки:</b>\n" + "\n".join(not_full)
@@ -1158,6 +1255,7 @@ async def check_cwl_events(chat_id: int) -> None:
                             member.get("name", "Гравець"),
                             len(member.get("attacks", [])),
                             1,
+                            sum(int(a.get("stars", 0) or 0) for a in member.get("attacks", [])),
                         )
                         for member in our_clan.get("members", [])
                     ]
@@ -1180,7 +1278,9 @@ async def check_cwl_events(chat_id: int) -> None:
                             chat_id,
                             f"🏁 <b>Раунд ЛВК проти «{esc(opp_clan.get('name', 'суперника'))}» завершено!</b>\n\n"
                             f"{war_result_text(our_clan, opp_clan)}\n"
-                            f"⭐ Рахунок: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n\n"
+                            f"⭐ Рахунок: <b>{our_clan.get('stars', 0)}</b> — <b>{opp_clan.get('stars', 0)}</b>\n"
+                            f"💥 Руйнування: <b>{float(our_clan.get('destructionPercentage', 0) or 0):.2f}%</b> — "
+                            f"<b>{float(opp_clan.get('destructionPercentage', 0) or 0):.2f}%</b>\n\n"
                             f"{missed}",
                         )
                     mark_state(ended_key)
@@ -1310,8 +1410,9 @@ async def check_raid_events(chat_id: int) -> None:
                 limit = 6
 
             count = int(count or 0)
+            gold = int((raid_members.get(tag) or {}).get("capitalResourcesLooted", 0) or 0)
             total_attacks += count
-            rows.append((tag, name, count, limit))
+            rows.append((tag, name, count, limit, gold))
             if count < limit:
                 unfinished.append(f"• {format_mention(tag, name)} — {count}/{limit} ⚔️")
 
