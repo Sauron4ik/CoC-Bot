@@ -294,7 +294,7 @@ def format_mention(tag: str, name: str) -> str:
 
 def rank_with_ties(items: list, value_func, top_n: int = 5) -> list[tuple[int, Any]]:
     """Sort items by value_func descending and return (rank, item) pairs.
- 
+
     Standard competition ranking: equal values share the same rank number, and if the
     top_n-th place is tied among several items, ALL of them are included (not just the
     first one encountered) so nobody with an equal score is arbitrarily dropped.
@@ -315,8 +315,8 @@ def rank_with_ties(items: list, value_func, top_n: int = 5) -> list[tuple[int, A
             prev_value = value
         result.append((rank, item))
     return result
- 
- 
+
+
 def topic_kwargs(thread_id: int) -> dict[str, int]:
     return {"message_thread_id": thread_id} if thread_id else {}
 
@@ -467,21 +467,21 @@ async def cmd_stats(message: types.Message):
             ]
         )
     await answer_html_lines(message, lines)
- 
- 
+
+
 @dp.message(Command("top"))
 async def cmd_top(message: types.Message):
     month_key = datetime.now(BOT_TIMEZONE).strftime("%Y-%m")
     history = load_json(HISTORY_FILE, {})
     month = history.get(month_key, {})
- 
+
     lines = [f"🏆 <b>Рейтинг активності за {month_key}:</b>", ""]
- 
+
     # --- Донат (поточний ігровий сезон, з живих даних клану) ---
     clan_data = await clash.get(f"clans/{ENCODED_TAG}")
     members = clan_data.get("memberList", []) if clan_data else []
     donor_ranking = rank_with_ties(members, lambda m: int(m.get("donations", 0) or 0))
- 
+
     lines.append("🎁 <b>Топ-5 донатерів:</b>")
     if donor_ranking:
         for rank, m in donor_ranking:
@@ -492,13 +492,13 @@ async def cmd_top(message: types.Message):
     else:
         lines.append("Поки що немає донатів у цьому сезоні.")
     lines.append("")
- 
+
     # --- Зірки КВ + ЛВК за місяць (з накопиченої історії) ---
     star_ranking = rank_with_ties(
         list(month.items()),
         lambda item: item[1].get("cw_stars", 0) + item[1].get("cwl_stars", 0),
     )
- 
+
     lines.append("⭐ <b>Топ-5 за зірками КВ/ЛВК:</b>")
     if star_ranking:
         for rank, (tag, d) in star_ranking:
@@ -507,17 +507,17 @@ async def cmd_top(message: types.Message):
     else:
         lines.append("Поки що немає завершених КВ/ЛВК у цьому місяці.")
     lines.append("")
- 
+
     # --- Золото рейдів за місяць (з накопиченої історії) ---
     gold_ranking = rank_with_ties(list(month.items()), lambda item: item[1].get("raid_gold", 0))
- 
+
     lines.append("💰 <b>Топ-5 за золотом рейдів:</b>")
     if gold_ranking:
         for rank, (tag, d) in gold_ranking:
             lines.append(f"{rank}. {format_mention(tag, d.get('name', 'Гравець'))} — {d.get('raid_gold', 0):,}")
     else:
         lines.append("Поки що немає завершених рейдів у цьому місяці.")
- 
+
     await answer_html_lines(message, lines)
 
 
@@ -1342,6 +1342,35 @@ async def check_cwl_events(chat_id: int) -> None:
         mark_state(season_key)
 
 
+async def get_unfinished_raid_attackers(raid: dict[str, Any]) -> list[str]:
+    """Return formatted mention strings for every clan member who hasn't used all raid attacks.
+
+    Cross-references the FULL clan roster against the raid's member list, because the CoC API
+    only lists a player in raid "members" after their first attack — players with 0 attacks
+    would otherwise be silently skipped.
+    """
+    raid_members = {m.get("tag"): m for m in raid.get("members", [])}
+    clan_data = await clash.get(f"clans/{ENCODED_TAG}")
+    all_clan_members = clan_data.get("memberList", []) if clan_data else []
+
+    unfinished = []
+    for clan_member in all_clan_members:
+        tag = clan_member.get("tag", "")
+        name = clan_member.get("name", "Гравець")
+        if tag in raid_members:
+            member = raid_members[tag]
+            count = member.get("attacks", 0)
+            if isinstance(count, dict):
+                count = count.get("count", 0)
+            limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
+        else:
+            count = 0
+            limit = 6
+        if count < limit:
+            unfinished.append(f"{format_mention(tag, name)} {count}/{limit} ⚔️")
+    return unfinished
+
+
 async def check_raid_events(chat_id: int) -> None:
     data = await clash.get(f"clans/{ENCODED_TAG}/capitalraidseasons?limit=1")
     if not data or not data.get("items"):
@@ -1364,26 +1393,31 @@ async def check_raid_events(chat_id: int) -> None:
                 )
             mark_state(start_key)
 
-        reminder_key = f"raid_24h_{raid_id}"
-        if end_time and not state_once(reminder_key):
+        reminder_24h_key = f"raid_24h_{raid_id}"
+        if end_time and not state_once(reminder_24h_key):
             hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
             if 0 < hours_left <= 24.5:
-                unfinished = []
-                for member in raid.get("members", []):
-                    count = member.get("attacks", 0)
-                    if isinstance(count, dict):
-                        count = count.get("count", 0)
-                    limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
-                    if count < limit:
-                        unfinished.append(
-                            f"{format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} {count}/{limit} ⚔️"
-                        )
+                unfinished = await get_unfinished_raid_attackers(raid)
                 if unfinished:
                     await send_to_topic(
                         chat_id,
                         "Шановні " + ", ".join(unfinished) + ", зробіть, будь ласка, атаки в рейдах 😊🗡️",
                     )
-                mark_state(reminder_key)
+                mark_state(reminder_24h_key)
+
+        reminder_12h_key = f"raid_12h_{raid_id}"
+        if end_time and not state_once(reminder_12h_key):
+            hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
+            if 0 < hours_left <= 12.5:
+                unfinished = await get_unfinished_raid_attackers(raid)
+                if unfinished:
+                    await send_to_topic(
+                        chat_id,
+                        "⏰ Залишилось менше 12 годин! Шановні "
+                        + ", ".join(unfinished)
+                        + ", будь ласка, встигніть доатакувати в рейдах 🙏🗡️",
+                    )
+                mark_state(reminder_12h_key)
 
     if state == "ended":
         ended_key = f"raid_ended_{raid_id}"
