@@ -215,7 +215,7 @@ class ClashClient:
                     return None
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt == 2:
-                    logging.error("Помилка з'єднання з CoC API: %s", exc)
+                    logging.error("Помилка з'єднання з CoC API (%s): %r", endpoint, exc)
                     return None
                 await asyncio.sleep(1 + attempt * 2)
 
@@ -846,16 +846,11 @@ async def cmd_raid(msg: types.Message):
         await msg.answer("⚔️ Наразі немає активного Рейд-вікенду.")
         return
 
-    unfinished = []
-    for member in current.get("members", []):
-        used = member.get("attacks", 0)
-        if isinstance(used, dict):
-            used = used.get("count", 0)
-        limit = int(member.get("attackLimit", 5) or 5) + int(member.get("bonusAttackLimit", 0) or 0)
-        if used < limit:
-            unfinished.append(
-                f"• {format_mention(member.get('tag', ''), member.get('name', 'Гравець'))} — {used}/{limit} ⚔️"
-            )
+    unfinished = await get_unfinished_raid_attackers(current, sep=" — ")
+    if unfinished is None:
+        await msg.answer("⚠️ Не вдалося отримати склад клану від Supercell. Спробуйте трохи пізніше.")
+        return
+    unfinished = [f"• {item}" for item in unfinished]
 
     text = "🏹 <b>Поточний стан рейду:</b>\n\n"
     text += (
@@ -1004,6 +999,9 @@ async def cmd_raidstats(msg: types.Message):
     raid_members = {m.get("tag"): m for m in raid.get("members", [])}
     clan_data = await clash.get(f"clans/{ENCODED_TAG}")
     all_clan_members = clan_data.get("memberList", []) if clan_data else []
+    if not all_clan_members:
+        await msg.answer("⚠️ Не вдалося отримати склад клану від Supercell. Спробуйте трохи пізніше.")
+        return
 
     unfinished = []
     total_attacks = 0
@@ -1342,16 +1340,22 @@ async def check_cwl_events(chat_id: int) -> None:
         mark_state(season_key)
 
 
-async def get_unfinished_raid_attackers(raid: dict[str, Any]) -> list[str]:
+async def get_unfinished_raid_attackers(raid: dict[str, Any], sep: str = " ") -> Optional[list[str]]:
     """Return formatted mention strings for every clan member who hasn't used all raid attacks.
 
     Cross-references the FULL clan roster against the raid's member list, because the CoC API
     only lists a player in raid "members" after their first attack — players with 0 attacks
     would otherwise be silently skipped.
+
+    Returns None when the clan roster could not be loaded, so callers can retry later
+    instead of reporting an (incorrectly) empty list.
     """
     raid_members = {m.get("tag"): m for m in raid.get("members", [])}
     clan_data = await clash.get(f"clans/{ENCODED_TAG}")
     all_clan_members = clan_data.get("memberList", []) if clan_data else []
+    if not all_clan_members:
+        logging.warning("Не вдалося завантажити склад клану для перевірки рейдових атак")
+        return None
 
     unfinished = []
     for clan_member in all_clan_members:
@@ -1367,7 +1371,7 @@ async def get_unfinished_raid_attackers(raid: dict[str, Any]) -> list[str]:
             count = 0
             limit = 6
         if count < limit:
-            unfinished.append(f"{format_mention(tag, name)} {count}/{limit} ⚔️")
+            unfinished.append(f"{format_mention(tag, name)}{sep}{count}/{limit} ⚔️")
     return unfinished
 
 
@@ -1398,33 +1402,41 @@ async def check_raid_events(chat_id: int) -> None:
             hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
             if 0 < hours_left <= 24.5:
                 unfinished = await get_unfinished_raid_attackers(raid)
-                if unfinished:
-                    await send_to_topic(
-                        chat_id,
-                        "Шановні " + ", ".join(unfinished) + ", зробіть, будь ласка, атаки в рейдах 😊🗡️",
-                    )
-                mark_state(reminder_24h_key)
+                if unfinished is not None:
+                    if unfinished:
+                        await send_to_topic(
+                            chat_id,
+                            "Шановні " + ", ".join(unfinished) + ", зробіть, будь ласка, атаки в рейдах 😊🗡️",
+                        )
+                    mark_state(reminder_24h_key)
 
         reminder_12h_key = f"raid_12h_{raid_id}"
         if end_time and not state_once(reminder_12h_key):
             hours_left = (end_time - datetime.now(timezone.utc)).total_seconds() / 3600
             if 0 < hours_left <= 12.5:
                 unfinished = await get_unfinished_raid_attackers(raid)
-                if unfinished:
-                    await send_to_topic(
-                        chat_id,
-                        "⏰ Залишилось менше 12 годин! Шановні "
-                        + ", ".join(unfinished)
-                        + ", будь ласка, встигніть доатакувати в рейдах 🙏🗡️",
-                    )
-                mark_state(reminder_12h_key)
+                if unfinished is not None:
+                    if unfinished:
+                        await send_to_topic(
+                            chat_id,
+                            "⏰ Залишилось менше 12 годин! Шановні "
+                            + ", ".join(unfinished)
+                            + ", будь ласка, встигніть доатакувати в рейдах 🙏🗡️",
+                        )
+                    mark_state(reminder_12h_key)
 
     if state == "ended":
         ended_key = f"raid_ended_{raid_id}"
         recorded_key = f"raid_recorded_{raid_id}"
 
+        if state_once(recorded_key) and state_once(ended_key):
+            return
+
         clan_data = await clash.get(f"clans/{ENCODED_TAG}")
         all_clan_members = clan_data.get("memberList", []) if clan_data else []
+        if not all_clan_members:
+            logging.warning("Рейд завершено, але склад клану не завантажився, повторю наступного разу")
+            return
         raid_members = {member.get("tag"): member for member in raid.get("members", [])}
 
         rows = []
